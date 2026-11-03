@@ -257,3 +257,108 @@ func vcfDo(ctx context.Context, cl *http.Client, method, u, token string, body [
 	}
 	return json.Unmarshal(data, out)
 }
+
+// DiscoverVCFOps asks VCF Operations (the VCF 9.x successor of Aria/vRealize Operations) which
+// vCenters it monitors. It uses the Operations Suite API: acquire a token, then list the
+// VMWARE adapter instances, whose "VCURL" identifier is the vCenter address.
+// authSource is optional (blank = a local Operations user).
+func DiscoverVCFOps(ctx context.Context, host, user, pass, authSource string, insecure bool) ([]VCFVCenter, error) {
+	host = strings.TrimSpace(host)
+	if !strings.Contains(host, "://") {
+		host = "https://" + host
+	}
+	base := strings.TrimRight(host, "/")
+	cl := &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure}}}
+	defer cl.CloseIdleConnections()
+
+	login := map[string]string{"username": user, "password": pass}
+	if strings.TrimSpace(authSource) != "" {
+		login["authSource"] = strings.TrimSpace(authSource)
+	}
+	body, _ := json.Marshal(login)
+	var tok struct {
+		Token string `json:"token"`
+	}
+	if err := vcfDoAuth(ctx, cl, "POST", base+"/suite-api/api/auth/token/acquire", "", body, &tok); err != nil {
+		return nil, fmt.Errorf("VCF Operations login failed: %w", err)
+	}
+	if tok.Token == "" {
+		return nil, fmt.Errorf("VCF Operations login returned no token")
+	}
+	auth := "OpsToken " + tok.Token
+
+	type ident struct {
+		IdentifierType struct {
+			Name string `json:"name"`
+		} `json:"identifierType"`
+		Value string `json:"value"`
+	}
+	type key struct {
+		Name                string  `json:"name"`
+		ResourceIdentifiers []ident `json:"resourceIdentifiers"`
+	}
+	var adapters struct {
+		Instances []struct {
+			ResourceKey key `json:"resourceKey"`
+		} `json:"adapterInstancesInfoDto"`
+	}
+	if err := vcfDoAuth(ctx, cl, "GET", base+"/suite-api/api/adapters?adapterKindKey=VMWARE", auth, nil, &adapters); err != nil {
+		return nil, fmt.Errorf("could not list vCenter adapters: %w", err)
+	}
+	seen := map[string]bool{}
+	var out []VCFVCenter
+	for _, a := range adapters.Instances {
+		addr := ""
+		for _, id := range a.ResourceKey.ResourceIdentifiers {
+			if strings.EqualFold(id.IdentifierType.Name, "VCURL") && strings.TrimSpace(id.Value) != "" {
+				addr = strings.TrimSpace(id.Value)
+			}
+		}
+		if addr == "" {
+			continue
+		}
+		// the value may be a bare host name or a URL such as https://vc.corp/sdk
+		if strings.Contains(addr, "://") {
+			if u, err := url.Parse(addr); err == nil && u.Host != "" {
+				addr = u.Host
+			}
+		}
+		if k := strings.ToLower(addr); !seen[k] {
+			seen[k] = true
+			out = append(out, VCFVCenter{FQDN: addr, Domain: a.ResourceKey.Name})
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("VCF Operations has no vCenter adapter instances (or this user cannot see them)")
+	}
+	return out, nil
+}
+
+// vcfDoAuth is vcfDo with a complete Authorization header value.
+func vcfDoAuth(ctx context.Context, cl *http.Client, method, u, authHeader string, body []byte, out any) error {
+	req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if resp.StatusCode/100 != 2 {
+		msg := strings.TrimSpace(string(data))
+		if len(msg) > 200 {
+			msg = msg[:200]
+		}
+		return fmt.Errorf("%s %s: HTTP %d %s", method, u, resp.StatusCode, msg)
+	}
+	return json.Unmarshal(data, out)
+}

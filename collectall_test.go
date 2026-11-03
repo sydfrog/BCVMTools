@@ -104,3 +104,34 @@ func TestDiscoverVCF(t *testing.T) {
 		t.Fatal("expected login failure")
 	}
 }
+
+func TestDiscoverVCFOps(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/suite-api/api/auth/token/acquire" && r.Method == "POST":
+			var b map[string]string
+			json.NewDecoder(r.Body).Decode(&b)
+			if b["password"] != "good" || b["authSource"] != "vIDB" {
+				http.Error(w, `{"message":"bad credentials"}`, 401)
+				return
+			}
+			w.Write([]byte(`{"token":"abc","validity":1}`))
+		case r.URL.Path == "/suite-api/api/adapters" && r.URL.Query().Get("adapterKindKey") == "VMWARE" && r.Header.Get("Authorization") == "OpsToken abc":
+			w.Write([]byte(`{"adapterInstancesInfoDto":[
+			 {"resourceKey":{"name":"vc-mgmt","adapterKindKey":"VMWARE","resourceIdentifiers":[{"identifierType":{"name":"VCURL"},"value":"vc-mgmt.corp"},{"identifierType":{"name":"AUTO_CHANGES"},"value":"x"}]}},
+			 {"resourceKey":{"name":"vc-w1","resourceIdentifiers":[{"identifierType":{"name":"VCURL"},"value":"https://vc-w1.corp/sdk"}]}},
+			 {"resourceKey":{"name":"dup","resourceIdentifiers":[{"identifierType":{"name":"VCURL"},"value":"VC-MGMT.corp"}]}},
+			 {"resourceKey":{"name":"no-url","resourceIdentifiers":[]}}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	vcs, err := DiscoverVCFOps(context.Background(), srv.URL, "admin", "good", "vIDB", true)
+	if err != nil || len(vcs) != 2 || vcs[0].FQDN != "vc-mgmt.corp" || vcs[0].Domain != "vc-mgmt" || vcs[1].FQDN != "vc-w1.corp" {
+		t.Fatalf("got %+v err %v", vcs, err)
+	}
+	if _, err := DiscoverVCFOps(context.Background(), srv.URL, "admin", "bad", "vIDB", true); err == nil {
+		t.Fatal("expected login failure")
+	}
+}

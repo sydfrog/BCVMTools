@@ -863,6 +863,12 @@ func runGUI() error {
 			mw.Synchronize(doCollect)
 		}()
 	}
+	if os.Getenv("BCVMTOOLS_OPEN_DIALOG") != "" { // test hook: open the vCenters dialog on start
+		go func() {
+			time.Sleep(800 * time.Millisecond)
+			mw.Synchronize(func() { connectionsDialog(mw, &extra, true) })
+		}()
+	}
 	mw.Show()
 	mw.Run()
 	return nil

@@ -52,7 +52,7 @@ func connectionsDialog(owner walk.Form, conns *[]Conn, insecure bool) {
 	}
 	dlg.SetTitle("More vCenters / VCF")
 	dlg.SetLayout(vbox(walk.Margins{HNear: 12, VNear: 12, HFar: 12, VFar: 12}, 8))
-	dlg.SetMinMaxSize(walk.Size{Width: 820, Height: 640}, walk.Size{})
+	dlg.SetMinMaxSize(walk.Size{Width: 1000, Height: 700}, walk.Size{})
 
 	hdr, _ := walk.NewLabel(dlg)
 	hdr.SetText("Additional vCenters. These are collected at the same time as the vCenter in the main window,\nand every row is tagged with the vCenter it came from.")
@@ -78,8 +78,8 @@ func connectionsDialog(owner walk.Form, conns *[]Conn, insecure bool) {
 	gb1.SetTitle("Add a vCenter")
 	gb1.SetLayout(hbox(walk.Margins{HNear: 10, VNear: 8, HFar: 10, VFar: 10}, 10))
 	srv := field(gb1, "vCenter or ESXi host", 240, false, "")
-	usr := field(gb1, "User (blank = main window user)", 200, false, "")
-	pw := field(gb1, "Password (blank = main window password)", 220, true, "")
+	usr := field(gb1, "User (blank = main window user)", 240, false, "")
+	pw := field(gb1, "Password (blank = main window password)", 260, true, "")
 	b1 := box(gb1, vbox(walk.Margins{}, 3))
 	sp, _ := walk.NewLabel(b1)
 	sp.SetText(" ")
@@ -88,28 +88,40 @@ func connectionsDialog(owner walk.Form, conns *[]Conn, insecure bool) {
 
 	// ---- VCF discovery
 	gb2, _ := walk.NewGroupBox(dlg)
-	gb2.SetTitle("VMware Cloud Foundation: discover vCenters from SDDC Manager")
+	gb2.SetTitle("VMware Cloud Foundation: discover the vCenters automatically")
 	gb2.SetLayout(vbox(walk.Margins{HNear: 10, VNear: 8, HFar: 10, VFar: 10}, 8))
+	r0 := box(gb2, hbox(walk.Margins{}, 10))
+	mc := box(r0, vbox(walk.Margins{}, 3))
+	ml, _ := walk.NewLabel(mc)
+	ml.SetText("Discover from")
+	ml.SetTextColor(muted)
+	mode, _ := walk.NewComboBox(mc)
+	mode.SetModel([]string{"VCF Operations  (VCF 9.0 / 9.1)", "SDDC Manager  (VCF 5.x / 9.0)"})
+	mode.SetCurrentIndex(0)
+	mode.SetMinMaxSize(walk.Size{Width: 300, Height: 24}, walk.Size{Width: 300})
+	walk.NewHSpacer(r0)
 	r1 := box(gb2, hbox(walk.Margins{}, 10))
-	vh := field(r1, "SDDC Manager host", 240, false, "")
-	vu := field(r1, "SDDC Manager user", 200, false, "")
-	vp := field(r1, "SDDC Manager password", 220, true, "")
+	vh := field(r1, "VCF Operations / SDDC Manager host", 280, false, "")
+	vu := field(r1, "User", 180, false, "")
+	vp := field(r1, "Password", 190, true, "")
+	va := field(r1, "Auth source (Operations only; blank = local)", 260, false, "")
 	walk.NewHSpacer(r1)
 	same, _ := walk.NewCheckBox(gb2)
-	same.SetText("Use the same user and password for the discovered vCenters (typical when they share one SSO domain)")
-	same.SetChecked(true)
+	same.SetText("Use the same user and password to log in to the discovered vCenters")
 	r2 := box(gb2, hbox(walk.Margins{}, 10))
-	cu := field(r2, "vCenter user", 240, false, "")
-	cp := field(r2, "vCenter password", 220, true, "")
-	cu.SetEnabled(false)
-	cp.SetEnabled(false)
+	cu := field(r2, "vCenter user (blank = main window user)", 330, false, "")
+	cp := field(r2, "vCenter password (blank = main window password)", 350, true, "")
 	walk.NewHSpacer(r2)
 	same.CheckedChanged().Attach(func() {
 		cu.SetEnabled(!same.Checked())
 		cp.SetEnabled(!same.Checked())
 	})
+	mode.CurrentIndexChanged().Attach(func() {
+		va.SetEnabled(mode.CurrentIndex() == 0)
+		same.SetChecked(mode.CurrentIndex() == 1) // SDDC Manager SSO users usually work on the vCenters too
+	})
 	r3 := box(gb2, hbox(walk.Margins{}, 10))
-	discover := button(r3, "Discover and add", "Log in to SDDC Manager and add every vCenter it manages", 150)
+	discover := button(r3, "Discover and add", "Log in and add every vCenter it knows about", 150)
 	status, _ := walk.NewLabel(r3)
 	status.SetTextColor(muted)
 	walk.NewHSpacer(r3)
@@ -168,21 +180,28 @@ func connectionsDialog(owner walk.Form, conns *[]Conn, insecure bool) {
 	clearAll.Clicked().Attach(func() { *conns = nil; changed() })
 
 	discover.Clicked().Attach(func() {
-		host, user, pass := strings.TrimSpace(vh.Text()), strings.TrimSpace(vu.Text()), vp.Text()
+		host, user, pass, auth := strings.TrimSpace(vh.Text()), strings.TrimSpace(vu.Text()), vp.Text(), strings.TrimSpace(va.Text())
 		if host == "" || user == "" {
-			walk.MsgBox(dlg, "VCF", "Enter the SDDC Manager host and user.", walk.MsgBoxIconInformation)
+			walk.MsgBox(dlg, "VCF", "Enter the host and user for VCF Operations / SDDC Manager.", walk.MsgBoxIconInformation)
 			return
 		}
-		vcUser, vcPass := user, pass
-		if !same.Checked() {
-			vcUser, vcPass = strings.TrimSpace(cu.Text()), cp.Text()
+		ops := mode.CurrentIndex() == 0
+		vcUser, vcPass := strings.TrimSpace(cu.Text()), cp.Text()
+		if same.Checked() {
+			vcUser, vcPass = user, pass
 		}
 		discover.SetEnabled(false)
-		status.SetText("Contacting SDDC Manager...")
+		status.SetText("Contacting " + host + "...")
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
-			vcs, err := DiscoverVCF(ctx, host, user, pass, insecure)
+			var vcs []VCFVCenter
+			var err error
+			if ops {
+				vcs, err = DiscoverVCFOps(ctx, host, user, pass, auth, insecure)
+			} else {
+				vcs, err = DiscoverVCF(ctx, host, user, pass, insecure)
+			}
 			dlg.Synchronize(func() {
 				discover.SetEnabled(true)
 				if err != nil {
@@ -190,12 +209,16 @@ func connectionsDialog(owner walk.Form, conns *[]Conn, insecure bool) {
 					walk.MsgBox(dlg, "VCF discovery failed", err.Error(), walk.MsgBoxIconError)
 					return
 				}
+				tag := "VCF: "
+				if ops {
+					tag = "VCF Ops: "
+				}
 				added := 0
 				for _, v := range vcs {
 					if exists(v.FQDN) {
 						continue
 					}
-					*conns = append(*conns, Conn{Server: v.FQDN, User: vcUser, Password: vcPass, Source: "VCF: " + host + " / " + v.Domain})
+					*conns = append(*conns, Conn{Server: v.FQDN, User: vcUser, Password: vcPass, Source: tag + host + " / " + v.Domain})
 					added++
 				}
 				status.SetText(fmt.Sprintf("Found %d vCenter(s), added %d.", len(vcs), added))

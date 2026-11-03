@@ -33,14 +33,17 @@ Every row on every tab has a **vCenter** column (first column) naming the vCente
 
 * **GUI:** the main form collects from one vCenter as before. Press **More vCenters / VCF...** to add more
   vCenters (blank user/password fall back to the main window's) or to enter an **SDDC Manager** host, which
-  discovers every vCenter it manages. All vCenters are collected in parallel; one failing does not stop the
+  discovers every vCenter it manages. Choose **VCF Operations** (VCF 9.0 / 9.1, default) or **SDDC Manager** (VCF 5.x / 9.0) as the discovery source. All vCenters are collected in parallel; one failing does not stop the
   others. Server names and users are remembered between runs (never passwords).
-* **CLI:** `-s a.corp,b.corp` collects several; `-vcf sddc.corp -u admin@vsphere.local` discovers the vCenters
-  of a VCF instance (`-vcuser/-vcpass` if the vCenters use different credentials).
+* **CLI:** `-s a.corp,b.corp` collects several; `-vcfops ops.corp -u admin -vcuser administrator@vsphere.local`
+  discovers the vCenters from VCF Operations (`-vcfauth vIDB` for a non-local login); `-vcf sddc.corp` does the same
+  via SDDC Manager. Blank `-vcuser/-vcpass` reuse `-u/-p`.
 
-VCF discovery uses the SDDC Manager API (`POST /v1/tokens`, `GET /v1/vcenters`, falling back to `/v1/domains`)
-and then logs in to each vCenter with the given credentials. It is covered by tests against a mock SDDC Manager,
-not yet against a real VCF.
+VCF Operations discovery uses the Operations Suite API (`POST /suite-api/api/auth/token/acquire`, then
+`GET /suite-api/api/adapters?adapterKindKey=VMWARE` and the `VCURL` identifier of each adapter instance).
+SDDC Manager discovery uses `POST /v1/tokens` and `GET /v1/vcenters` (falling back to `/v1/domains`). Both then
+log in to each vCenter with the given credentials. They are covered by tests against mock servers, not yet
+against a real VCF.
 
 ## Tabs
 

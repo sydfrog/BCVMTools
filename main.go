@@ -32,7 +32,9 @@ func main() {
 		out      = flag.String("o", "", "output path (default bcvmtools_<server>_<timestamp>.xlsx, or a directory for csv)")
 		format   = flag.String("f", "xlsx", "output format: xlsx | csv")
 		timeout  = flag.Duration("timeout", 10*time.Minute, "overall timeout")
-		vcf      = flag.String("vcf", "", "VCF SDDC Manager host: discover and collect from all its vCenters (uses -u/-p)")
+		vcfOps   = flag.String("vcfops", "", "VCF Operations host (VCF 9.x): discover and collect from all its vCenters (uses -u/-p)")
+		vcfAuth  = flag.String("vcfauth", "", "VCF Operations auth source (blank = local user, e.g. vIDB)")
+		vcf      = flag.String("vcf", "", "SDDC Manager host (VCF 5.x / 9.0): discover and collect from all its vCenters (uses -u/-p)")
 		vcUser   = flag.String("vcuser", "", "user for the discovered vCenters (default: same as -u)")
 		vcPass   = flag.String("vcpass", "", "password for the discovered vCenters (default: same as -p)")
 		showVer  = flag.Bool("version", false, "print version")
@@ -53,7 +55,7 @@ func main() {
 		fmt.Println("bcvmtools", version)
 		return
 	}
-	if (*server == "" && *vcf == "") || *user == "" {
+	if (*server == "" && *vcf == "" && *vcfOps == "") || *user == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -90,6 +92,18 @@ func main() {
 			targets = append(targets, Target{Server: v.FQDN, User: vu, Password: vp, Source: "VCF: " + *vcf + " / " + v.Domain, Insecure: *insecure})
 		}
 		fmt.Fprintf(os.Stderr, "VCF %s: found %d vCenter(s)\n", *vcf, len(vcs))
+	}
+	if *vcfOps != "" {
+		vcs, err := DiscoverVCFOps(ctx, *vcfOps, *user, password, *vcfAuth, *insecure)
+		if err != nil {
+			fatal(err)
+		}
+		// blank vCenter credentials fall back to -u/-p
+		vu, vp := firstNonEmpty(*vcUser, *user), firstNonEmpty(*vcPass, password)
+		for _, v := range vcs {
+			targets = append(targets, Target{Server: v.FQDN, User: vu, Password: vp, Source: "VCF Ops: " + *vcfOps + " / " + v.Domain, Insecure: *insecure})
+		}
+		fmt.Fprintf(os.Stderr, "VCF Operations %s: found %d vCenter(s)\n", *vcfOps, len(vcs))
 	}
 	targets = dedupeTargets(targets)
 	sheets, results := CollectMany(ctx, targets)
