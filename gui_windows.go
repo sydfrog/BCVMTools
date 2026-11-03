@@ -248,6 +248,8 @@ func runGUI() error {
 	filter.SetMinMaxSize(walk.Size{Width: 240}, walk.Size{Width: 240})
 	clearBtn, _ := walk.NewPushButton(bar2)
 	clearBtn.SetText("Clear all filters")
+	colFilterBtn, _ := walk.NewPushButton(bar2)
+	colFilterBtn.SetText("Filter column...")
 	removeBtn, _ := walk.NewPushButton(bar2)
 	removeBtn.SetText("Remove selected rows")
 	keepBtn, _ := walk.NewPushButton(bar2)
@@ -264,11 +266,16 @@ func runGUI() error {
 	csvBtn, _ := walk.NewPushButton(bar3)
 	csvBtn.SetText("Export CSV folder...")
 	walk.NewHSpacer(bar3)
-	for _, b := range []*walk.PushButton{xlsxBtn, csvBtn, clearBtn, removeBtn, keepBtn, restoreBtn} {
+	for _, b := range []*walk.PushButton{xlsxBtn, csvBtn, clearBtn, colFilterBtn, removeBtn, keepBtn, restoreBtn} {
 		b.SetEnabled(false)
 	}
 
 	tabs, _ := walk.NewTabWidget(mw)
+	boldFont, _ := walk.NewFont("Segoe UI", 9, walk.FontBold)
+	regularFont, _ := walk.NewFont("Segoe UI", 9, 0)
+	if boldFont != nil {
+		tabs.SetFont(boldFont) // bold tab names; tables below get the regular font explicitly
+	}
 	status, _ := walk.NewLabel(mw)
 	status.SetText("Enter connection details and press Collect.")
 
@@ -293,7 +300,7 @@ func runGUI() error {
 	refreshCounts := func(i int) {
 		m := models[i]
 		pages[i].SetTitle(fmt.Sprintf("%s (%d)", m.sheet.Name, len(m.sheet.Rows)))
-		status.SetText(fmt.Sprintf("%s: showing %d of %d rows (original %d). Click a heading to sort; use its arrow to filter.",
+		status.SetText(fmt.Sprintf("%s: showing %d of %d rows (original %d). Click a heading to sort. To filter: right-click a heading, use its arrow, or press 'Filter column...'.",
 			m.sheet.Name, len(m.view), len(m.sheet.Rows), len(m.orig)))
 	}
 	syncControls := func() {
@@ -353,6 +360,20 @@ func runGUI() error {
 		decorate(i)
 		refreshCounts(i)
 	}
+	colFilterBtn.Clicked().Attach(func() {
+		i := curIdx()
+		if i < 0 {
+			return
+		}
+		m := models[i]
+		fl := make([]bool, len(m.sheet.Header))
+		for c := range fl {
+			fl[c] = m.filters[c] != nil
+		}
+		if c := columnPickMenu(mw.Handle(), m.sheet.Header, fl); c >= 0 {
+			openColumnFilter(i, c)
+		}
+	})
 	removeBtn.Clicked().Attach(func() {
 		if i := curIdx(); i >= 0 {
 			sel := views[i].SelectedIndexes()
@@ -391,6 +412,9 @@ func runGUI() error {
 			page.SetLayout(walk.NewVBoxLayout())
 			tv, _ := walk.NewTableView(page)
 			tv.SetColumnsOrderable(true)
+			if regularFont != nil {
+				tv.SetFont(regularFont)
+			}
 			tv.SetMultiSelection(true)
 			var tcols []*walk.TableViewColumn
 			for ci, h := range s.Header {
@@ -426,7 +450,7 @@ func runGUI() error {
 			tv.SetModel(m)
 			tabs.Pages().Add(page)
 		}
-		for _, b := range []*walk.PushButton{xlsxBtn, csvBtn, clearBtn, removeBtn, keepBtn, restoreBtn} {
+		for _, b := range []*walk.PushButton{xlsxBtn, csvBtn, clearBtn, colFilterBtn, removeBtn, keepBtn, restoreBtn} {
 			b.SetEnabled(len(ss) > 0)
 		}
 		syncControls()

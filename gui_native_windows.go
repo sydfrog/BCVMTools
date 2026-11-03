@@ -177,17 +177,38 @@ func listViewProc(hwnd, msg, wp, lp uintptr) uintptr {
 	return win.CallWindowProc(s.old, h, uint32(msg), wp, lp)
 }
 
+// listViewOf finds the real list view inside a walk TableView. The TableView is a
+// container holding a frozen and a normal SysListView32; the normal one has the columns.
+func listViewOf(tv *walk.TableView) (lv, hdr win.HWND) {
+	best := int32(-1)
+	for c := win.GetWindow(tv.Handle(), win.GW_CHILD); c != 0; c = win.GetWindow(c, win.GW_HWNDNEXT) {
+		var buf [64]uint16
+		n, _ := win.GetClassName(c, &buf[0], len(buf))
+		if syscall.UTF16ToString(buf[:n]) != "SysListView32" {
+			continue
+		}
+		h := win.HWND(win.SendMessage(c, win.LVM_GETHEADER, 0, 0))
+		if h == 0 {
+			continue
+		}
+		if cnt := int32(win.SendMessage(h, win.HDM_GETITEMCOUNT, 0, 0)); cnt > best {
+			best, lv, hdr = cnt, c, h
+		}
+	}
+	return
+}
+
 func headerOf(tv *walk.TableView) win.HWND {
-	return win.HWND(win.SendMessage(tv.Handle(), win.LVM_GETHEADER, 0, 0))
+	_, h := listViewOf(tv)
+	return h
 }
 
 // hookHeader subclasses the table so its header is custom drawn and reports arrow / right clicks.
 func hookHeader(tv *walk.TableView, hk headerHooks) {
-	hdr := headerOf(tv)
-	if hdr == 0 {
+	h, hdr := listViewOf(tv)
+	if h == 0 {
 		return
 	}
-	h := tv.Handle()
 	old := win.SetWindowLongPtr(h, win.GWLP_WNDPROC, subProc)
 	if old == 0 {
 		return
@@ -245,4 +266,24 @@ func headerMenu(owner win.HWND, x, y int32, hasFilter bool) int {
 	add(win.MF_SEPARATOR, 0, "")
 	add(win.MF_STRING, 5, "Clear all filters on this tab")
 	return int(win.TrackPopupMenuEx(hm, win.TPM_RETURNCMD|win.TPM_LEFTALIGN|win.TPM_TOPALIGN, x, y, owner, nil))
+}
+
+// columnPickMenu lists all columns (filtered ones marked) at the cursor and returns the chosen index or -1.
+func columnPickMenu(owner win.HWND, names []string, filtered []bool) int {
+	hm := win.CreatePopupMenu()
+	if hm == 0 {
+		return -1
+	}
+	defer win.DestroyMenu(hm)
+	for i, n := range names {
+		if filtered[i] {
+			n = "\u25CF " + n
+		}
+		p, _ := syscall.UTF16PtrFromString(n)
+		pAppendMenu.Call(uintptr(hm), win.MF_STRING, uintptr(i+1), uintptr(unsafe.Pointer(p)))
+	}
+	var pt win.POINT
+	win.GetCursorPos(&pt)
+	r := int(win.TrackPopupMenuEx(hm, win.TPM_RETURNCMD|win.TPM_LEFTALIGN|win.TPM_TOPALIGN, pt.X, pt.Y, owner, nil))
+	return r - 1
 }
