@@ -116,7 +116,7 @@ func autoWidth(s *Sheet, c int) int {
 			n = l
 		}
 	}
-	return max(70, min(n, 55)*7+34)
+	return max(70, min(n, 55)*7+46)
 }
 
 // Sort implements walk.Sorter: numeric columns sort numerically, others case-insensitively.
@@ -285,17 +285,10 @@ func runGUI() error {
 		}
 		return i
 	}
-	// headings show a dot when the column has an active filter; the split-button arrow is (re)applied
+	// (re)apply the header arrows and repaint headings (filtered columns are drawn amber)
 	decorate := func(i int) {
-		m := models[i]
-		for c, col := range cols[i] {
-			t := m.sheet.Header[c]
-			if m.filters[c] != nil {
-				t += "  \u25CF"
-			}
-			col.SetTitle(t)
-		}
 		markHeaderButtons(views[i], len(cols[i]))
+		repaintHeader(views[i])
 	}
 	refreshCounts := func(i int) {
 		m := models[i]
@@ -338,6 +331,27 @@ func runGUI() error {
 			decorate(i)
 			refreshCounts(i)
 		}
+	}
+	openHeaderMenu := func(i, col int, x, y int32) {
+		if i >= len(models) || col < 0 || col >= len(models[i].sheet.Header) {
+			return
+		}
+		m := models[i]
+		switch headerMenu(mw.Handle(), x, y, m.filters[col] != nil) {
+		case 1:
+			openColumnFilter(i, col)
+		case 2:
+			m.SetColumnFilter(col, nil)
+		case 3:
+			m.Sort(col, walk.SortAscending)
+		case 4:
+			m.Sort(col, walk.SortDescending)
+		case 5:
+			m.ClearFilters()
+			syncControls()
+		}
+		decorate(i)
+		refreshCounts(i)
 	}
 	removeBtn.Clicked().Attach(func() {
 		if i := curIdx(); i >= 0 {
@@ -389,8 +403,21 @@ func runGUI() error {
 			m := newSheetModel(s)
 			tv.SetCellStyler(m)
 			idx := len(models)
-			hookHeaderDropdown(tv, func(col int) {
-				mw.Synchronize(func() { openColumnFilter(idx, col) })
+			hookHeader(tv, headerHooks{
+				onDropdown: func(col int) { mw.Synchronize(func() { openColumnFilter(idx, col) }) },
+				onContext: func(col int, x, y int32) {
+					mw.Synchronize(func() { openHeaderMenu(idx, col, x, y) })
+				},
+				style: func(col int) (string, bool, int) {
+					sortDir := 0
+					if m.sorted && m.SortedColumn() == col {
+						sortDir = 1
+						if m.SortOrder() == walk.SortDescending {
+							sortDir = 2
+						}
+					}
+					return s.Header[col], m.filters[col] != nil, sortDir
+				},
 			})
 			cols = append(cols, tcols)
 			models = append(models, m)
