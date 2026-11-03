@@ -23,10 +23,12 @@ default (`-insecure=false` to enforce). A read-only vCenter role is enough.
 
 ## Tabs
 
-vInfo, vCPU, vMemory, vDisk, vPartition, vNetwork, vSnapshot, vTools, vCD, vHost, vCluster, vRP,
-vDatastore, vSwitch, vPort, vSC_VMK, vNIC, vHBA, dvSwitch, dvPort, vLicense, vSource, vHealth.
+Info, CPU, Memory, Disk, Partition, Network, Snapshot, Tools, CD, Host, Cluster, RP, Datastore,
+Switch, Port, SC_VMK, NIC, HBA, dvSwitch, dvPort, License, Source, Health.
 
-Not (yet) replicated from RVTools: vUSB, vFileInfo, vMultiPath, vSC_VMK extras, performance history.
+Host includes `Cores per CPU` and `Licensable cores` = sockets x max(16, cores per socket).
+
+Not (yet) replicated from RVTools: USB, FileInfo, MultiPath, performance history.
 
 ## Why it is fast
 

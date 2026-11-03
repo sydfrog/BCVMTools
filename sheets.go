@@ -270,7 +270,19 @@ func BuildSheets(inv *Inventory, server string) []*Sheet {
 		}
 	}
 	sheets = append(sheets, vHealth)
+	for _, sh := range sheets {
+		sh.Name = tabName(sh.Name)
+	}
 	return sheets
+}
+
+// tabName drops the RVTools-style leading lowercase 'v' (vInfo -> Info, vSC_VMK -> SC_VMK).
+// Names such as dvSwitch are left alone.
+func tabName(n string) string {
+	if len(n) > 1 && n[0] == 'v' && n[1] >= 'A' && n[1] <= 'Z' {
+		return n[1:]
+	}
+	return n
 }
 
 func derefRef(r *types.ManagedObjectReference) types.ManagedObjectReference {
@@ -296,7 +308,7 @@ func nicNetwork(inv *Inventory, c *types.VirtualEthernetCard) string {
 }
 
 func hostSheet(inv *Inventory) *Sheet {
-	s := &Sheet{Name: "vHost", Header: []string{"Host", "Datacenter", "Cluster", "Connection state", "In Maintenance Mode", "Power state", "CPU Model", "Speed MHz", "# CPU", "# Cores", "# Threads", "CPU usage MHz", "CPU usage %", "# Memory MiB", "Memory usage MiB", "Memory usage %", "# VMs", "Vendor", "Model", "Serial / Service tag", "UUID", "ESX Version", "Build", "Boot time", "# NICs", "# HBAs", "Overall status"}}
+	s := &Sheet{Name: "vHost", Header: []string{"Host", "Datacenter", "Cluster", "Connection state", "In Maintenance Mode", "Power state", "CPU Model", "Speed MHz", "# CPU", "# Cores", "# Threads", "Cores per CPU", "Licensable cores", "CPU usage MHz", "CPU usage %", "# Memory MiB", "Memory usage MiB", "Memory usage %", "# VMs", "Vendor", "Model", "Serial / Service tag", "UUID", "ESX Version", "Build", "Boot time", "# NICs", "# HBAs", "Overall status"}}
 	for _, h := range inv.Hosts {
 		hw := h.Summary.Hardware
 		e := inv.Entities[h.Self]
@@ -322,6 +334,12 @@ func hostSheet(inv *Inventory) *Sheet {
 		if p := h.Summary.Config.Product; p != nil {
 			ver, build = p.FullName, p.Build
 		}
+		// Licensable cores: each CPU socket is licensed for at least 16 cores.
+		var coresPer, licensable any = "", ""
+		if pkgs > 0 {
+			per := int(cores) / int(pkgs)
+			coresPer, licensable = per, int(pkgs)*max(16, per)
+		}
 		cpuPct, memPct := "", ""
 		if cap := int64(mhz) * int64(cores); cap > 0 {
 			cpuPct = fmt.Sprintf("%.1f", float64(h.Summary.QuickStats.OverallCpuUsage)*100/float64(cap))
@@ -330,7 +348,7 @@ func hostSheet(inv *Inventory) *Sheet {
 			memPct = fmt.Sprintf("%.1f", float64(h.Summary.QuickStats.OverallMemoryUsage)*100/float64(memMiB))
 		}
 		s.Rows = append(s.Rows, []any{h.Name, dc, cl, string(h.Runtime.ConnectionState), bs(h.Runtime.InMaintenanceMode), string(h.Runtime.PowerState),
-			cpu, mhz, pkgs, cores, threads, h.Summary.QuickStats.OverallCpuUsage, cpuPct, memMiB, h.Summary.QuickStats.OverallMemoryUsage, memPct,
+			cpu, mhz, pkgs, cores, threads, coresPer, licensable, h.Summary.QuickStats.OverallCpuUsage, cpuPct, memMiB, h.Summary.QuickStats.OverallMemoryUsage, memPct,
 			inv.hostVMs[h.Self], vendor, model, serial, uuid, ver, build, ts(h.Runtime.BootTime), nn, nh, string(h.OverallStatus)})
 	}
 	sort.SliceStable(s.Rows, func(i, j int) bool { return fmt.Sprint(s.Rows[i][0]) < fmt.Sprint(s.Rows[j][0]) })

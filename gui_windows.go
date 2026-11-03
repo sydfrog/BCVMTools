@@ -7,51 +7,162 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lxn/walk"
 )
 
-// sheetModel is a virtual, filterable table model over a Sheet (cheap even for 100k rows).
+// sheetModel is a virtual, sortable, filterable table model over a Sheet.
+// Sorting and row removal modify sheet.Rows, so exports reflect what is on screen
+// (minus any active filter, which only hides rows until "Keep only filtered rows").
 type sheetModel struct {
 	walk.TableModelBase
-	sheet *Sheet
-	view  []int // indexes of visible rows
+	walk.SorterBase
+	sheet  *Sheet
+	orig   [][]any
+	view   []int // indexes into sheet.Rows that are visible
+	query  string
+	col    int // -1 = all columns
+	sorted bool
 }
 
 func newSheetModel(s *Sheet) *sheetModel {
-	m := &sheetModel{sheet: s}
-	m.Filter("")
+	m := &sheetModel{sheet: s, col: -1}
+	m.orig = append([][]any(nil), s.Rows...)
+	m.applyFilter()
 	return m
 }
 
 func (m *sheetModel) RowCount() int { return len(m.view) }
 
-func (m *sheetModel) Value(row, col int) interface{} {
-	r := m.sheet.Rows[m.view[row]]
-	if col < len(r) && r[col] != nil {
-		return fmt.Sprint(r[col])
+func cellStr(r []any, c int) string {
+	if c < len(r) && r[c] != nil {
+		return fmt.Sprint(r[c])
 	}
 	return ""
 }
 
-func (m *sheetModel) Filter(q string) {
-	q = strings.ToLower(q)
+func (m *sheetModel) Value(row, col int) interface{} {
+	return cellStr(m.sheet.Rows[m.view[row]], col)
+}
+
+func (m *sheetModel) applyFilter() {
+	q := strings.ToLower(m.query)
 	m.view = m.view[:0]
 	for i, r := range m.sheet.Rows {
 		if q == "" {
 			m.view = append(m.view, i)
 			continue
 		}
-		for _, v := range r {
-			if v != nil && strings.Contains(strings.ToLower(fmt.Sprint(v)), q) {
+		if m.col >= 0 {
+			if strings.Contains(strings.ToLower(cellStr(r, m.col)), q) {
+				m.view = append(m.view, i)
+			}
+			continue
+		}
+		for c := range r {
+			if strings.Contains(strings.ToLower(cellStr(r, c)), q) {
 				m.view = append(m.view, i)
 				break
 			}
 		}
 	}
 	m.PublishRowsReset()
+}
+
+func (m *sheetModel) SetFilter(q string, col int) {
+	m.query, m.col = q, col
+	m.applyFilter()
+}
+
+// Sort implements walk.Sorter: numeric columns sort numerically, others case-insensitively.
+func (m *sheetModel) Sort(col int, order walk.SortOrder) error {
+	m.SorterBase.Sort(col, order)
+	m.sorted = true
+	type key struct {
+		row []any
+		f   float64
+		num bool
+		s   string
+	}
+	keys := make([]key, len(m.sheet.Rows))
+	for i, r := range m.sheet.Rows {
+		str := cellStr(r, col)
+		f, err := strconv.ParseFloat(strings.TrimSpace(str), 64)
+		keys[i] = key{r, f, err == nil && str != "", strings.ToLower(str)}
+	}
+	cmp := func(a, b key) int {
+		switch {
+		case a.num && b.num:
+			if a.f < b.f {
+				return -1
+			} else if a.f > b.f {
+				return 1
+			}
+			return 0
+		case a.num != b.num: // numbers before text
+			if a.num {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(a.s, b.s)
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		c := cmp(keys[i], keys[j])
+		if order == walk.SortDescending {
+			return c > 0
+		}
+		return c < 0
+	})
+	for i := range keys {
+		m.sheet.Rows[i] = keys[i].row
+	}
+	m.applyFilter()
+	return nil
+}
+
+func (m *sheetModel) removeWhere(drop func(sheetIdx int) bool) {
+	kept := m.sheet.Rows[:0:0]
+	for i, r := range m.sheet.Rows {
+		if !drop(i) {
+			kept = append(kept, r)
+		}
+	}
+	m.sheet.Rows = kept
+	m.applyFilter()
+}
+
+func (m *sheetModel) RemoveRows(viewRows []int) {
+	drop := map[int]bool{}
+	for _, v := range viewRows {
+		if v >= 0 && v < len(m.view) {
+			drop[m.view[v]] = true
+		}
+	}
+	m.removeWhere(func(i int) bool { return drop[i] })
+}
+
+func (m *sheetModel) KeepFiltered() {
+	keep := map[int]bool{}
+	for _, i := range m.view {
+		keep[i] = true
+	}
+	m.removeWhere(func(i int) bool { return !keep[i] })
+	m.query = ""
+	m.applyFilter()
+}
+
+func (m *sheetModel) Restore() {
+	m.sheet.Rows = append([][]any(nil), m.orig...)
+	if m.sorted {
+		m.Sort(m.SortedColumn(), m.SortOrder())
+		return
+	}
+	m.applyFilter()
 }
 
 func runGUI() error {
@@ -88,52 +199,125 @@ func runGUI() error {
 	collectBtn.SetText("Collect")
 	walk.NewHSpacer(bar)
 
-	// ---- filter + export bar
+	// ---- filter bar
 	bar2, _ := walk.NewComposite(mw)
 	bar2.SetLayout(walk.NewHBoxLayout())
 	fl, _ := walk.NewLabel(bar2)
-	fl.SetText("Filter (current tab):")
+	fl.SetText("Filter:")
+	colBox, _ := walk.NewComboBox(bar2)
+	colBox.SetMinMaxSize(walk.Size{Width: 180}, walk.Size{Width: 180})
 	filter, _ := walk.NewLineEdit(bar2)
-	filter.SetMinMaxSize(walk.Size{Width: 260}, walk.Size{Width: 260})
-	xlsxBtn, _ := walk.NewPushButton(bar2)
-	xlsxBtn.SetText("Export Excel...")
-	csvBtn, _ := walk.NewPushButton(bar2)
-	csvBtn.SetText("Export CSV folder...")
+	filter.SetMinMaxSize(walk.Size{Width: 240}, walk.Size{Width: 240})
+	clearBtn, _ := walk.NewPushButton(bar2)
+	clearBtn.SetText("Clear filter")
+	removeBtn, _ := walk.NewPushButton(bar2)
+	removeBtn.SetText("Remove selected rows")
+	keepBtn, _ := walk.NewPushButton(bar2)
+	keepBtn.SetText("Keep only filtered rows")
+	restoreBtn, _ := walk.NewPushButton(bar2)
+	restoreBtn.SetText("Restore all rows")
 	walk.NewHSpacer(bar2)
-	xlsxBtn.SetEnabled(false)
-	csvBtn.SetEnabled(false)
+
+	// ---- export bar
+	bar3, _ := walk.NewComposite(mw)
+	bar3.SetLayout(walk.NewHBoxLayout())
+	xlsxBtn, _ := walk.NewPushButton(bar3)
+	xlsxBtn.SetText("Export Excel...")
+	csvBtn, _ := walk.NewPushButton(bar3)
+	csvBtn.SetText("Export CSV folder...")
+	walk.NewHSpacer(bar3)
+	for _, b := range []*walk.PushButton{xlsxBtn, csvBtn, clearBtn, removeBtn, keepBtn, restoreBtn} {
+		b.SetEnabled(false)
+	}
 
 	tabs, _ := walk.NewTabWidget(mw)
 	status, _ := walk.NewLabel(mw)
 	status.SetText("Enter connection details and press Collect.")
 
-	curModel := func() *sheetModel {
+	var (
+		views   []*walk.TableView
+		pages   []*walk.TabPage
+		syncing bool
+	)
+	curIdx := func() int {
 		i := tabs.CurrentIndex()
 		if i < 0 || i >= len(models) {
-			return nil
+			return -1
 		}
-		return models[i]
+		return i
 	}
-	filter.TextChanged().Attach(func() {
-		if m := curModel(); m != nil {
-			m.Filter(filter.Text())
+	refreshCounts := func(i int) {
+		m := models[i]
+		pages[i].SetTitle(fmt.Sprintf("%s (%d)", m.sheet.Name, len(m.sheet.Rows)))
+		status.SetText(fmt.Sprintf("%s: showing %d of %d rows (original %d). Click a column heading to sort.",
+			m.sheet.Name, len(m.view), len(m.sheet.Rows), len(m.orig)))
+	}
+	// load the current tab's filter state into the filter controls
+	syncControls := func() {
+		i := curIdx()
+		if i < 0 {
+			return
+		}
+		m := models[i]
+		syncing = true
+		colBox.SetModel(append([]string{"All columns"}, m.sheet.Header...))
+		colBox.SetCurrentIndex(m.col + 1)
+		filter.SetText(m.query)
+		syncing = false
+		refreshCounts(i)
+	}
+	applyControls := func() {
+		if syncing {
+			return
+		}
+		if i := curIdx(); i >= 0 {
+			models[i].SetFilter(filter.Text(), colBox.CurrentIndex()-1)
+			refreshCounts(i)
+		}
+	}
+	filter.TextChanged().Attach(applyControls)
+	colBox.CurrentIndexChanged().Attach(applyControls)
+	tabs.CurrentIndexChanged().Attach(syncControls)
+	clearBtn.Clicked().Attach(func() { filter.SetText("") })
+	removeBtn.Clicked().Attach(func() {
+		if i := curIdx(); i >= 0 {
+			sel := views[i].SelectedIndexes()
+			if len(sel) == 0 {
+				walk.MsgBox(mw, "BCVMTools", "Select one or more rows first (Ctrl/Shift-click for several).", walk.MsgBoxIconInformation)
+				return
+			}
+			models[i].RemoveRows(sel)
+			views[i].SetSelectedIndexes(nil)
+			refreshCounts(i)
 		}
 	})
-	tabs.CurrentIndexChanged().Attach(func() {
-		if m := curModel(); m != nil {
-			m.Filter(filter.Text())
+	keepBtn.Clicked().Attach(func() {
+		if i := curIdx(); i >= 0 {
+			if models[i].query == "" {
+				walk.MsgBox(mw, "BCVMTools", "Enter a filter first; rows that do not match will be removed.", walk.MsgBoxIconInformation)
+				return
+			}
+			models[i].KeepFiltered()
+			syncControls()
+		}
+	})
+	restoreBtn.Clicked().Attach(func() {
+		if i := curIdx(); i >= 0 {
+			models[i].Restore()
+			syncControls()
 		}
 	})
 
 	showSheets := func(ss []*Sheet) {
 		tabs.Pages().Clear()
-		sheets, models = ss, nil
+		sheets, models, views, pages = ss, nil, nil, nil
 		for _, s := range ss {
 			page, _ := walk.NewTabPage()
 			page.SetTitle(fmt.Sprintf("%s (%d)", s.Name, len(s.Rows)))
 			page.SetLayout(walk.NewVBoxLayout())
 			tv, _ := walk.NewTableView(page)
 			tv.SetColumnsOrderable(true)
+			tv.SetMultiSelection(true)
 			for _, h := range s.Header {
 				c := walk.NewTableViewColumn()
 				c.SetTitle(h)
@@ -142,11 +326,15 @@ func runGUI() error {
 			}
 			m := newSheetModel(s)
 			models = append(models, m)
+			views = append(views, tv)
+			pages = append(pages, page)
 			tv.SetModel(m)
 			tabs.Pages().Add(page)
 		}
-		xlsxBtn.SetEnabled(len(ss) > 0)
-		csvBtn.SetEnabled(len(ss) > 0)
+		for _, b := range []*walk.PushButton{xlsxBtn, csvBtn, clearBtn, removeBtn, keepBtn, restoreBtn} {
+			b.SetEnabled(len(ss) > 0)
+		}
+		syncControls()
 	}
 
 	collectBtn.Clicked().Attach(func() {
