@@ -21,16 +21,16 @@ import (
 type sheetModel struct {
 	walk.TableModelBase
 	walk.SorterBase
-	sheet  *Sheet
-	orig   [][]any
-	view   []int // indexes into sheet.Rows that are visible
-	query  string
-	col    int // -1 = all columns
-	sorted bool
+	sheet   *Sheet
+	orig    [][]any
+	view    []int // indexes into sheet.Rows that are visible
+	query   string
+	filters map[int]map[string]bool // per-column allowed values (Excel-style); nil = no filter
+	sorted  bool
 }
 
 func newSheetModel(s *Sheet) *sheetModel {
-	m := &sheetModel{sheet: s, col: -1}
+	m := &sheetModel{sheet: s, filters: map[int]map[string]bool{}}
 	m.orig = append([][]any(nil), s.Rows...)
 	m.applyFilter()
 	return m
@@ -49,33 +49,74 @@ func (m *sheetModel) Value(row, col int) interface{} {
 	return cellStr(m.sheet.Rows[m.view[row]], col)
 }
 
+func (m *sheetModel) matches(r []any, q string) bool {
+	for c, allowed := range m.filters {
+		if !allowed[cellStr(r, c)] {
+			return false
+		}
+	}
+	if q == "" {
+		return true
+	}
+	for c := range r {
+		if strings.Contains(strings.ToLower(cellStr(r, c)), q) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *sheetModel) applyFilter() {
 	q := strings.ToLower(m.query)
 	m.view = m.view[:0]
 	for i, r := range m.sheet.Rows {
-		if q == "" {
+		if m.matches(r, q) {
 			m.view = append(m.view, i)
-			continue
-		}
-		if m.col >= 0 {
-			if strings.Contains(strings.ToLower(cellStr(r, m.col)), q) {
-				m.view = append(m.view, i)
-			}
-			continue
-		}
-		for c := range r {
-			if strings.Contains(strings.ToLower(cellStr(r, c)), q) {
-				m.view = append(m.view, i)
-				break
-			}
 		}
 	}
 	m.PublishRowsReset()
 }
 
-func (m *sheetModel) SetFilter(q string, col int) {
-	m.query, m.col = q, col
+func (m *sheetModel) Filtered() bool { return m.query != "" || len(m.filters) > 0 }
+
+func (m *sheetModel) SetSearch(q string) {
+	m.query = q
 	m.applyFilter()
+}
+
+// SetColumnFilter sets the allowed values for a column (nil clears it).
+func (m *sheetModel) SetColumnFilter(col int, allowed map[string]bool) {
+	if allowed == nil {
+		delete(m.filters, col)
+	} else {
+		m.filters[col] = allowed
+	}
+	m.applyFilter()
+}
+
+func (m *sheetModel) ClearFilters() {
+	m.query = ""
+	m.filters = map[int]map[string]bool{}
+	m.applyFilter()
+}
+
+// StyleCell shades every second row (zebra striping) to make wide tables easier to read.
+func (m *sheetModel) StyleCell(st *walk.CellStyle) {
+	if st.Row()%2 == 1 {
+		st.BackgroundColor = walk.RGB(236, 242, 249)
+	}
+}
+
+// autoWidth picks a column width (px) from the content, capped, with a small
+// contribution from the heading so long headings do not force wide columns.
+func autoWidth(s *Sheet, c int) int {
+	n := min(len(s.Header[c]), 12)
+	for _, r := range s.Rows {
+		if l := len(cellStr(r, c)); l > n {
+			n = l
+		}
+	}
+	return max(70, min(n, 55)*7+34)
 }
 
 // Sort implements walk.Sorter: numeric columns sort numerically, others case-insensitively.
@@ -152,8 +193,7 @@ func (m *sheetModel) KeepFiltered() {
 		keep[i] = true
 	}
 	m.removeWhere(func(i int) bool { return !keep[i] })
-	m.query = ""
-	m.applyFilter()
+	m.ClearFilters()
 }
 
 func (m *sheetModel) Restore() {
@@ -203,13 +243,11 @@ func runGUI() error {
 	bar2, _ := walk.NewComposite(mw)
 	bar2.SetLayout(walk.NewHBoxLayout())
 	fl, _ := walk.NewLabel(bar2)
-	fl.SetText("Filter:")
-	colBox, _ := walk.NewComboBox(bar2)
-	colBox.SetMinMaxSize(walk.Size{Width: 180}, walk.Size{Width: 180})
+	fl.SetText("Search all columns:")
 	filter, _ := walk.NewLineEdit(bar2)
 	filter.SetMinMaxSize(walk.Size{Width: 240}, walk.Size{Width: 240})
 	clearBtn, _ := walk.NewPushButton(bar2)
-	clearBtn.SetText("Clear filter")
+	clearBtn.SetText("Clear all filters")
 	removeBtn, _ := walk.NewPushButton(bar2)
 	removeBtn.SetText("Remove selected rows")
 	keepBtn, _ := walk.NewPushButton(bar2)
@@ -237,6 +275,7 @@ func runGUI() error {
 	var (
 		views   []*walk.TableView
 		pages   []*walk.TabPage
+		cols    [][]*walk.TableViewColumn
 		syncing bool
 	)
 	curIdx := func() int {
@@ -246,39 +285,60 @@ func runGUI() error {
 		}
 		return i
 	}
+	// headings show a dot when the column has an active filter; the split-button arrow is (re)applied
+	decorate := func(i int) {
+		m := models[i]
+		for c, col := range cols[i] {
+			t := m.sheet.Header[c]
+			if m.filters[c] != nil {
+				t += "  \u25CF"
+			}
+			col.SetTitle(t)
+		}
+		markHeaderButtons(views[i], len(cols[i]))
+	}
 	refreshCounts := func(i int) {
 		m := models[i]
 		pages[i].SetTitle(fmt.Sprintf("%s (%d)", m.sheet.Name, len(m.sheet.Rows)))
-		status.SetText(fmt.Sprintf("%s: showing %d of %d rows (original %d). Click a column heading to sort.",
+		status.SetText(fmt.Sprintf("%s: showing %d of %d rows (original %d). Click a heading to sort; use its arrow to filter.",
 			m.sheet.Name, len(m.view), len(m.sheet.Rows), len(m.orig)))
 	}
-	// load the current tab's filter state into the filter controls
 	syncControls := func() {
 		i := curIdx()
 		if i < 0 {
 			return
 		}
-		m := models[i]
 		syncing = true
-		colBox.SetModel(append([]string{"All columns"}, m.sheet.Header...))
-		colBox.SetCurrentIndex(m.col + 1)
-		filter.SetText(m.query)
+		filter.SetText(models[i].query)
 		syncing = false
+		decorate(i)
 		refreshCounts(i)
 	}
-	applyControls := func() {
+	filter.TextChanged().Attach(func() {
 		if syncing {
 			return
 		}
 		if i := curIdx(); i >= 0 {
-			models[i].SetFilter(filter.Text(), colBox.CurrentIndex()-1)
+			models[i].SetSearch(filter.Text())
+			refreshCounts(i)
+		}
+	})
+	tabs.CurrentIndexChanged().Attach(syncControls)
+	clearBtn.Clicked().Attach(func() {
+		if i := curIdx(); i >= 0 {
+			models[i].ClearFilters()
+			syncControls()
+		}
+	})
+	openColumnFilter := func(i, col int) {
+		if col < 0 || col >= len(models[i].sheet.Header) {
+			return
+		}
+		if columnFilterDialog(mw, models[i], col) {
+			decorate(i)
 			refreshCounts(i)
 		}
 	}
-	filter.TextChanged().Attach(applyControls)
-	colBox.CurrentIndexChanged().Attach(applyControls)
-	tabs.CurrentIndexChanged().Attach(syncControls)
-	clearBtn.Clicked().Attach(func() { filter.SetText("") })
 	removeBtn.Clicked().Attach(func() {
 		if i := curIdx(); i >= 0 {
 			sel := views[i].SelectedIndexes()
@@ -293,8 +353,8 @@ func runGUI() error {
 	})
 	keepBtn.Clicked().Attach(func() {
 		if i := curIdx(); i >= 0 {
-			if models[i].query == "" {
-				walk.MsgBox(mw, "BCVMTools", "Enter a filter first; rows that do not match will be removed.", walk.MsgBoxIconInformation)
+			if !models[i].Filtered() {
+				walk.MsgBox(mw, "BCVMTools", "Apply a filter first (search box or a heading arrow); rows that do not match will be removed.", walk.MsgBoxIconInformation)
 				return
 			}
 			models[i].KeepFiltered()
@@ -310,7 +370,7 @@ func runGUI() error {
 
 	showSheets := func(ss []*Sheet) {
 		tabs.Pages().Clear()
-		sheets, models, views, pages = ss, nil, nil, nil
+		sheets, models, views, pages, cols = ss, nil, nil, nil, nil
 		for _, s := range ss {
 			page, _ := walk.NewTabPage()
 			page.SetTitle(fmt.Sprintf("%s (%d)", s.Name, len(s.Rows)))
@@ -318,13 +378,21 @@ func runGUI() error {
 			tv, _ := walk.NewTableView(page)
 			tv.SetColumnsOrderable(true)
 			tv.SetMultiSelection(true)
-			for _, h := range s.Header {
+			var tcols []*walk.TableViewColumn
+			for ci, h := range s.Header {
 				c := walk.NewTableViewColumn()
 				c.SetTitle(h)
-				c.SetWidth(max(80, 9*len(h)))
+				c.SetWidth(autoWidth(s, ci))
 				tv.Columns().Add(c)
+				tcols = append(tcols, c)
 			}
 			m := newSheetModel(s)
+			tv.SetCellStyler(m)
+			idx := len(models)
+			hookHeaderDropdown(tv, func(col int) {
+				mw.Synchronize(func() { openColumnFilter(idx, col) })
+			})
+			cols = append(cols, tcols)
 			models = append(models, m)
 			views = append(views, tv)
 			pages = append(pages, page)
