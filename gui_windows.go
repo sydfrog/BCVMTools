@@ -384,13 +384,18 @@ func runGUI() error {
 	tracef("safe mode: %v", safeUI)
 	tracef("started")
 	set := loadSettings()
-	var extra []Conn
-	for _, s := range set.Extra {
-		extra = append(extra, Conn{Server: s.Server, User: s.User, Source: s.Source})
+	var conns []Conn      // every vCenter to collect from, each with its own credentials (passwords: memory only)
+	if set.Server != "" { // settings written by older versions held a single primary vCenter
+		conns = append(conns, Conn{Server: set.Server, User: set.User, Source: "Manual"})
 	}
-	if env := os.Getenv("BCVMTOOLS_EXTRA"); env != "" { // test hook: comma separated hosts
+	for _, s := range set.Extra {
+		if !hasConn(conns, s.Server) {
+			conns = append(conns, Conn{Server: s.Server, User: s.User, Source: s.Source})
+		}
+	}
+	if env := os.Getenv("BCVMTOOLS_EXTRA"); env != "" { // test hook: comma separated hosts, credentials from VI_USER / VI_PASSWORD
 		for _, h := range strings.Split(env, ",") {
-			extra = append(extra, Conn{Server: strings.TrimSpace(h), Source: "Manual"})
+			conns = append(conns, Conn{Server: strings.TrimSpace(h), User: os.Getenv("VI_USER"), Password: os.Getenv("VI_PASSWORD"), Source: "Manual"})
 		}
 	}
 	if set.Width < 1000 || set.Height < 600 {
@@ -413,21 +418,55 @@ func runGUI() error {
 	mw.SetMinMaxSize(walk.Size{Width: 1000, Height: 600}, walk.Size{})
 	mw.SetLayout(vbox(walk.Margins{HNear: 12, VNear: 10, HFar: 12, VFar: 6}, 10))
 
-	// ---- connection
+	// ---- connections: one list for every vCenter, each with its own credentials
 	gb, _ := walk.NewGroupBox(mw)
-	gb.SetTitle("Connection")
-	gb.SetLayout(hbox(walk.Margins{HNear: 10, VNear: 8, HFar: 10, VFar: 10}, 14))
-	server := field(gb, "vCenter or ESXi host", 280, false, firstNonEmpty(set.Server, os.Getenv("VI_SERVER")))
-	user := field(gb, "User name", 220, false, firstNonEmpty(set.User, os.Getenv("VI_USER")))
-	pass := field(gb, "Password", 190, true, os.Getenv("VI_PASSWORD"))
-	opts := box(gb, vbox(walk.Margins{}, 3))
-	sp, _ := walk.NewLabel(opts)
-	sp.SetText(" ")
-	verify, _ := walk.NewCheckBox(opts)
+	gb.SetLayout(vbox(walk.Margins{HNear: 10, VNear: 6, HFar: 10, VFar: 8}, 6))
+	gb.SetMinMaxSize(walk.Size{Height: 250}, walk.Size{Height: 250})
+
+	rowA := box(gb, hbox(walk.Margins{}, 10))
+	rowA.SetMinMaxSize(walk.Size{Height: 50}, walk.Size{Height: 50})
+	server := field(rowA, "vCenter or ESXi host", 300, false, os.Getenv("VI_SERVER"))
+	user := field(rowA, "User name", 230, false, os.Getenv("VI_USER"))
+	pass := field(rowA, "Password", 200, true, os.Getenv("VI_PASSWORD"))
+	addBox := box(rowA, vbox(walk.Margins{}, 3))
+	spA, _ := walk.NewLabel(addBox)
+	spA.SetText(" ")
+	addBtn := button(addBox, "Add vCenter", "Add the host on the left to the list with this user name and password (Enter in the host box does the same)", 110)
+	walk.NewHSpacer(rowA)
+
+	connModelV := &connModel{items: &conns}
+	connTV, _ := walk.NewTableView(gb)
+	connTV.SetMultiSelection(true)
+	if uiFont != nil {
+		connTV.SetFont(uiFont)
+	}
+	for _, c := range []struct {
+		t string
+		w int
+	}{{"vCenter / ESXi host", 330}, {"User name", 240}, {"Password", 130}, {"Source", 420}} {
+		col := walk.NewTableViewColumn()
+		col.SetTitle(c.t)
+		col.SetWidth(c.w)
+		connTV.Columns().Add(col)
+	}
+	connTV.SetModel(connModelV)
+	connTV.SetMinMaxSize(walk.Size{Height: 96}, walk.Size{Height: 130})
+
+	rowB := box(gb, hbox(walk.Margins{}, 8))
+	rowB.SetMinMaxSize(walk.Size{Height: 30}, walk.Size{Height: 30})
+	applySelBtn := button(rowB, "Apply user/password to selected", "Give the selected vCenters the user name and password typed above (leave one blank to keep the existing value)", 220)
+	applyAllBtn := button(rowB, "Apply user/password to all", "Give every vCenter in the list the user name and password typed above", 190)
+	vcfBtn := button(rowB, "Discover from VCF...", "Find the vCenters of a VMware Cloud Foundation instance (VCF Operations or SDDC Manager) and add them to the list", 160)
+	removeConnBtn := button(rowB, "Remove selected", "Remove the selected vCenters from the list", 130)
+	walk.NewHSpacer(rowB)
+
+	rowC := box(gb, hbox(walk.Margins{}, 14))
+	rowC.SetMinMaxSize(walk.Size{Height: 32}, walk.Size{Height: 32})
+	verify, _ := walk.NewCheckBox(rowC)
 	verify.SetText("Verify TLS certificate")
 	verify.SetChecked(set.Verify)
 	verify.SetToolTipText("Leave unticked for self-signed certificates (the usual vCenter default)")
-	tb := box(gb, vbox(walk.Margins{}, 3))
+	tb := box(rowC, hbox(walk.Margins{}, 6))
 	tl, _ := walk.NewLabel(tb)
 	tl.SetText("Timeout per vCenter (min)")
 	tl.SetTextColor(muted)
@@ -438,20 +477,15 @@ func runGUI() error {
 	if set.TimeoutMin <= 0 {
 		timeEdit.SetValue(10)
 	}
-	timeEdit.SetMinMaxSize(walk.Size{Width: 90, Height: 24}, walk.Size{Width: 90})
+	timeEdit.SetMinMaxSize(walk.Size{Width: 80, Height: 24}, walk.Size{Width: 80})
 	timeEdit.SetToolTipText("How long each vCenter may take to log in and be collected before it is reported as timed out. Raise this for slow vCenters.")
-	btnBox := box(gb, vbox(walk.Margins{}, 3))
-	sp2, _ := walk.NewLabel(btnBox)
-	sp2.SetText(" ")
-	collectBtn := button(btnBox, "Collect", "Connect and gather the inventory (Enter / F5)", 120)
+	walk.NewHSpacer(rowC)
+	collectBtn := button(rowC, "Collect", "Connect to every vCenter in the list and gather the inventory (Enter / F5)", 140)
 	if uiBold != nil {
 		collectBtn.SetFont(uiBold)
 	}
-	moreBox := box(gb, vbox(walk.Margins{}, 3))
-	sp3, _ := walk.NewLabel(moreBox)
-	sp3.SetText(" ")
-	moreBtn := button(moreBox, "More vCenters / VCF...", "Collect from several vCenters at once, or discover them from a VCF SDDC Manager", 170)
-	walk.NewHSpacer(gb)
+	setConnTitle := func() { gb.SetTitle(fmt.Sprintf("Connections (%d)", len(conns))) }
+	setConnTitle()
 
 	progress, _ := walk.NewProgressBar(mw)
 	progress.SetMarqueeMode(true)
@@ -773,7 +807,7 @@ func runGUI() error {
 
 	busy := false
 	var cancelRun context.CancelFunc
-	inputs := []walk.Window{server, user, pass, verify, moreBtn, timeEdit}
+	inputs := []walk.Window{server, user, pass, addBtn, connTV, applySelBtn, applyAllBtn, vcfBtn, removeConnBtn, verify, timeEdit}
 	endBusy := func() {
 		busy = false
 		cancelRun = nil
@@ -829,51 +863,143 @@ func runGUI() error {
 	}
 	savePrefs := func() {
 		b := mw.BoundsPixels()
-		s := settings{Server: strings.TrimSpace(server.Text()), User: strings.TrimSpace(user.Text()), Verify: verify.Checked(), TimeoutMin: int(timeEdit.Value()), Width: b.Width, Height: b.Height}
-		for _, c := range extra {
+		s := settings{Verify: verify.Checked(), TimeoutMin: int(timeEdit.Value()), Width: b.Width, Height: b.Height}
+		for _, c := range conns {
 			s.Extra = append(s.Extra, savedConn{Server: c.Server, User: c.User, Source: c.Source})
 		}
 		saveSettings(s)
 	}
-	updateMore := func() {
-		if len(extra) == 0 {
-			moreBtn.SetText("More vCenters / VCF...")
-		} else {
-			moreBtn.SetText(fmt.Sprintf("More vCenters / VCF (%d)...", len(extra)))
-		}
+	refreshConns := func() {
+		connModelV.PublishRowsReset()
+		setConnTitle()
 	}
-	updateMore()
-	moreBtn.Clicked().Attach(func() {
-		connectionsDialog(mw, &extra, !verify.Checked())
-		updateMore()
+	// addTyped adds the host typed in the first box (with the typed user name and password).
+	addTyped := func() bool {
+		host := strings.TrimSpace(server.Text())
+		if host == "" {
+			return false
+		}
+		if hasConn(conns, host) {
+			setStatus(host + " is already in the list.")
+			server.SetText("")
+			return true
+		}
+		conns = append(conns, Conn{Server: host, User: strings.TrimSpace(user.Text()), Password: pass.Text(), Source: "Manual"})
+		server.SetText("")
+		refreshConns()
+		return true
+	}
+	addBtn.Clicked().Attach(func() {
+		if !addTyped() {
+			walk.MsgBox(mw, "Add vCenter", "Type the vCenter or ESXi host name (or IP address) in the first box.", walk.MsgBoxIconInformation)
+			return
+		}
 		savePrefs()
+	})
+	server.KeyDown().Attach(func(k walk.Key) {
+		if k == walk.KeyReturn && addTyped() {
+			savePrefs()
+		}
+	})
+	applyCreds := func(rows []int) {
+		u, p := strings.TrimSpace(user.Text()), pass.Text()
+		if u == "" && p == "" {
+			walk.MsgBox(mw, "Apply credentials", "Type a user name and/or password in the boxes above first.", walk.MsgBoxIconInformation)
+			return
+		}
+		for _, i := range rows {
+			if i < 0 || i >= len(conns) {
+				continue
+			}
+			if u != "" {
+				conns[i].User = u
+			}
+			if p != "" {
+				conns[i].Password = p
+			}
+		}
+		refreshConns()
+		savePrefs()
+	}
+	applySelBtn.Clicked().Attach(func() {
+		sel := connTV.SelectedIndexes()
+		if len(sel) == 0 {
+			walk.MsgBox(mw, "Apply credentials", "Select one or more vCenters in the list first (Ctrl/Shift-click to select several).", walk.MsgBoxIconInformation)
+			return
+		}
+		applyCreds(sel)
+	})
+	applyAllBtn.Clicked().Attach(func() {
+		if len(conns) == 0 {
+			walk.MsgBox(mw, "Apply credentials", "The list is empty. Add a vCenter first.", walk.MsgBoxIconInformation)
+			return
+		}
+		all := make([]int, len(conns))
+		for i := range all {
+			all[i] = i
+		}
+		applyCreds(all)
+	})
+	removeConnBtn.Clicked().Attach(func() {
+		drop := map[int]bool{}
+		for _, i := range connTV.SelectedIndexes() {
+			drop[i] = true
+		}
+		if len(drop) == 0 {
+			walk.MsgBox(mw, "Remove", "Select the vCenters to remove first.", walk.MsgBoxIconInformation)
+			return
+		}
+		var keep []Conn
+		for i, c := range conns {
+			if !drop[i] {
+				keep = append(keep, c)
+			}
+		}
+		conns = keep
+		connTV.SetSelectedIndexes(nil)
+		refreshConns()
+		savePrefs()
+	})
+	vcfBtn.Clicked().Attach(func() {
+		if vcfDialog(mw, &conns, !verify.Checked()) {
+			refreshConns()
+			savePrefs()
+		}
 	})
 	doCollect := func() {
 		if busy {
 			return
 		}
-		srv, usr, pw, ins := strings.TrimSpace(server.Text()), strings.TrimSpace(user.Text()), pass.Text(), !verify.Checked()
-		var targets []Target
-		if srv != "" {
-			if usr == "" {
-				walk.MsgBox(mw, "Connection", "Please enter the user name.", walk.MsgBoxIconWarning)
+		ins := !verify.Checked()
+		if strings.TrimSpace(server.Text()) != "" {
+			if strings.TrimSpace(user.Text()) == "" {
+				walk.MsgBox(mw, "Connection", "Please enter the user name for "+strings.TrimSpace(server.Text())+".", walk.MsgBoxIconWarning)
 				return
 			}
-			targets = append(targets, Target{Server: srv, User: usr, Password: pw, Source: "Manual", Insecure: ins})
+			addTyped() // a host typed but not yet added is added now, so the one-vCenter workflow stays quick
 		}
-		for _, c := range extra {
-			t := Target{Server: c.Server, User: firstNonEmpty(c.User, usr), Password: firstNonEmpty(c.Password, pw), Source: c.Source, Insecure: ins}
-			if t.User == "" {
-				walk.MsgBox(mw, "Connection", "No user name for "+c.Server+". Enter one in the main window or in the vCenter list.", walk.MsgBoxIconWarning)
-				return
-			}
-			targets = append(targets, t)
-		}
-		targets = dedupeTargets(targets)
-		if len(targets) == 0 {
-			walk.MsgBox(mw, "Connection", "Please enter a vCenter or ESXi host (or add some with 'More vCenters / VCF').", walk.MsgBoxIconWarning)
+		if len(conns) == 0 {
+			walk.MsgBox(mw, "Connection", "The connection list is empty. Type a vCenter or ESXi host above and press 'Add vCenter' (or Collect), or use 'Discover from VCF...'.", walk.MsgBoxIconWarning)
 			return
 		}
+		var missing []string
+		var targets []Target
+		for _, c := range conns {
+			if strings.TrimSpace(c.User) == "" || c.Password == "" {
+				missing = append(missing, c.Server)
+			}
+			targets = append(targets, Target{Server: c.Server, User: strings.TrimSpace(c.User), Password: c.Password, Source: c.Source, Insecure: ins})
+		}
+		if len(missing) > 0 {
+			shown := missing
+			if len(shown) > 8 {
+				shown = append(append([]string(nil), shown[:8]...), fmt.Sprintf("... and %d more", len(missing)-8))
+			}
+			walk.MsgBox(mw, "Credentials needed", fmt.Sprintf("%d vCenter(s) have no user name or password yet (highlighted in the list):\n\n%s\n\nType the credentials above, select the vCenters and press 'Apply user/password to selected' (or 'to all').",
+				len(missing), strings.Join(shown, "\n")), walk.MsgBoxIconWarning)
+			return
+		}
+		targets = dedupeTargets(targets)
 		savePrefs()
 		busy = true
 		for _, w := range inputs {
@@ -1013,10 +1139,10 @@ func runGUI() error {
 	w, h := min(set.Width, sw-40), min(set.Height, sh-80)
 	mw.SetBoundsPixels(walk.Rectangle{X: (sw - w) / 2, Y: (sh-h)/2 - 20, Width: w, Height: h})
 	mw.Closing().Attach(func(*bool, walk.CloseReason) { savePrefs() })
-	if strings.TrimSpace(server.Text()) == "" {
+	if len(conns) == 0 {
 		server.SetFocus()
 	} else {
-		pass.SetFocus()
+		collectBtn.SetFocus()
 	}
 
 	// test hook: BCVMTOOLS_AUTOCOLLECT=1 starts a collection as soon as the window is up
@@ -1029,7 +1155,7 @@ func runGUI() error {
 	if os.Getenv("BCVMTOOLS_OPEN_DIALOG") != "" { // test hook: open the vCenters dialog on start
 		go func() {
 			time.Sleep(800 * time.Millisecond)
-			mw.Synchronize(func() { connectionsDialog(mw, &extra, true) })
+			mw.Synchronize(func() { vcfDialog(mw, &conns, true); refreshConns() })
 		}()
 	}
 	startUIWatchdog(mw, dir)

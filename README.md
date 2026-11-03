@@ -39,10 +39,14 @@ striping, leaving the plain Windows controls (sorting and *Filter column...* sti
 Every row on every tab has a **vCenter** column (first column) naming the vCenter it came from, and a
 **vCenters** tab (first tab) lists each connection: status, source, version, build, counts, time and any error.
 
-* **GUI:** the main form collects from one vCenter as before. Press **More vCenters / VCF...** to add more
-  vCenters (blank user/password fall back to the main window's) or to enter an **SDDC Manager** host, which
-  discovers every vCenter it manages. Choose **VCF Operations** (VCF 9.0 / 9.1, default) or **SDDC Manager** (VCF 5.x / 9.0) as the discovery source. All vCenters are collected in parallel; one failing does not stop the
-  others. Server names and users are remembered between runs (never passwords).
+* **GUI:** every vCenter lives in one **Connections** list in the main window, each with its **own user name and
+  password** (passwords are kept in memory only, never saved). Type a host, user and password and press *Add vCenter*
+  (or just press Collect for a single vCenter). *Discover from VCF...* logs in to **VCF Operations** (VCF 9.0 / 9.1,
+  default) or **SDDC Manager** (VCF 5.x / 9.0) and adds every vCenter it manages to the same list. To give vCenters
+  credentials: type them in the User/Password boxes, then press *Apply user/password to selected* (select rows with
+  Ctrl/Shift-click) or *Apply user/password to all*. Rows missing credentials are highlighted amber and Collect asks you
+  to fill them in. All vCenters are collected in parallel; one failing does not stop the others. Host names and user
+  names are remembered between runs.
 * **CLI:** `-s a.corp,b.corp` collects several; `-vcfops ops.corp -u admin -vcuser administrator@vsphere.local`
   discovers the vCenters from VCF Operations (`-vcfauth vIDB` for a non-local login); `-vcf sddc.corp` does the same
   via SDDC Manager. Blank `-vcuser/-vcpass` reuse `-u/-p`.
