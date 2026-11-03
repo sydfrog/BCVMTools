@@ -331,13 +331,15 @@ func runGUI() error {
 		models []*sheetModel
 	)
 	// Make sure the per-user data folder exists and is writable before doing anything else.
-	if _, err := appDataDir(); err != nil {
+	dir, err := appDataDir()
+	if err != nil {
 		walk.MsgBox(nil, "BCVMTools cannot start",
 			err.Error()+"\n\nBCVMTools stores its settings and crash log in this folder. "+
 				"Fix the folder permissions (or ask your administrator) and start the application again.",
 			walk.MsgBoxIconError)
 		return err
 	}
+	captureFatalCrashes(dir)
 	set := loadSettings()
 	if set.Width < 1000 || set.Height < 600 {
 		set.Width, set.Height = 1360, 820
@@ -426,7 +428,6 @@ func runGUI() error {
 	setStatus("Ready")
 
 	showWelcome := func() {
-		tabs.Pages().Clear()
 		page, _ := walk.NewTabPage()
 		page.SetTitle("Getting started")
 		page.SetLayout(vbox(walk.Margins{HNear: 20, VNear: 20, HFar: 20, VFar: 20}, 8))
@@ -451,6 +452,7 @@ func runGUI() error {
 		pages   []*walk.TabPage
 		cols    [][]*walk.TableViewColumn
 		syncing bool
+		loading bool
 	)
 	curIdx := func() int {
 		i := tabs.CurrentIndex()
@@ -478,6 +480,9 @@ func runGUI() error {
 		}
 	}
 	syncControls := func() {
+		if loading {
+			return
+		}
 		i := curIdx()
 		if i < 0 {
 			return
@@ -578,7 +583,14 @@ func runGUI() error {
 	})
 
 	showSheets := func(ss []*Sheet) {
-		tabs.Pages().Clear()
+		// walk panics if a layout pass runs while the tab control has no pages, so the new
+		// pages are added first and the old ones removed afterwards.
+		loading = true
+		defer func() { loading = false }()
+		oldN := tabs.Pages().Len()
+		if len(ss) == 0 {
+			return // keep the current pages: walk panics on an empty tab control
+		}
 		sheets, models, views, pages, cols = ss, nil, nil, nil, nil
 		for _, s := range ss {
 			page, _ := walk.NewTabPage()
@@ -624,10 +636,17 @@ func runGUI() error {
 			tv.SetModel(m)
 			tabs.Pages().Add(page)
 		}
+		for i := 0; i < oldN; i++ {
+			tabs.Pages().RemoveAt(0)
+		}
+		if len(ss) > 0 {
+			tabs.SetCurrentIndex(0)
+		}
 		for _, b := range allBtns {
 			b.SetEnabled(len(ss) > 0)
 		}
 		filter.SetEnabled(len(ss) > 0)
+		loading = false
 		syncControls()
 	}
 
@@ -643,6 +662,11 @@ func runGUI() error {
 		if err != nil {
 			setStatus("Failed: " + err.Error())
 			walk.MsgBox(mw, "Collection failed", err.Error(), walk.MsgBoxIconError)
+			return
+		}
+		if len(ss) == 0 {
+			setStatus("Nothing was collected.")
+			walk.MsgBox(mw, "Collection failed", "The server returned no inventory data.", walk.MsgBoxIconWarning)
 			return
 		}
 		showSheets(ss)
@@ -665,6 +689,7 @@ func runGUI() error {
 			return
 		}
 		srv, usr, pw, ins := strings.TrimSpace(server.Text()), strings.TrimSpace(user.Text()), pass.Text(), !verify.Checked()
+		saveSettings(settings{Server: srv, User: usr, Verify: verify.Checked(), Width: mw.BoundsPixels().Width, Height: mw.BoundsPixels().Height})
 		busy = true
 		collectBtn.SetEnabled(false)
 		gb.SetEnabled(false)
@@ -759,6 +784,13 @@ func runGUI() error {
 		pass.SetFocus()
 	}
 
+	// test hook: BCVMTOOLS_AUTOCOLLECT=1 starts a collection as soon as the window is up
+	if os.Getenv("BCVMTOOLS_AUTOCOLLECT") != "" {
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			mw.Synchronize(doCollect)
+		}()
+	}
 	mw.Show()
 	mw.Run()
 	return nil

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/vmware/govmomi/license"
@@ -75,17 +76,17 @@ func Collect(ctx context.Context, c *vim25.Client) (*Inventory, error) {
 		}
 	}
 
-	g.Go(retrieve("HostSystem", []string{
+	goSafe(g, retrieve("HostSystem", []string{
 		"name", "parent", "summary", "runtime", "config.network", "config.product",
 		"config.storageDevice.hostBusAdapter", "config.network.dnsConfig", "overallStatus",
 	}, &inv.Hosts, false))
-	g.Go(retrieve("ClusterComputeResource", []string{"name", "parent", "summary", "configurationEx", "overallStatus", "configStatus"}, &inv.Clusters, false))
-	g.Go(retrieve("Datastore", []string{"name", "parent", "summary", "host", "vm", "overallStatus"}, &inv.DS, false))
-	g.Go(retrieve("ResourcePool", []string{"name", "parent", "config", "vm", "owner", "summary.quickStats"}, &inv.RPs, false))
-	g.Go(retrieve("DistributedVirtualPortgroup", []string{"name", "key", "config", "parent"}, &inv.DVPGs, false))
-	g.Go(retrieve("DistributedVirtualSwitch", []string{"name", "parent", "summary", "config"}, &inv.DVSs, false))
+	goSafe(g, retrieve("ClusterComputeResource", []string{"name", "parent", "summary", "configurationEx", "overallStatus", "configStatus"}, &inv.Clusters, false))
+	goSafe(g, retrieve("Datastore", []string{"name", "parent", "summary", "host", "vm", "overallStatus"}, &inv.DS, false))
+	goSafe(g, retrieve("ResourcePool", []string{"name", "parent", "config", "vm", "owner", "summary.quickStats"}, &inv.RPs, false))
+	goSafe(g, retrieve("DistributedVirtualPortgroup", []string{"name", "key", "config", "parent"}, &inv.DVPGs, false))
+	goSafe(g, retrieve("DistributedVirtualSwitch", []string{"name", "parent", "summary", "config"}, &inv.DVSs, false))
 
-	g.Go(func() error {
+	goSafe(g, func() error {
 		var ents []mo.ManagedEntity
 		m := view.NewManager(c)
 		v, err := m.CreateContainerView(gctx, root, []string{"Folder", "Datacenter", "ComputeResource"}, true)
@@ -103,7 +104,7 @@ func Collect(ctx context.Context, c *vim25.Client) (*Inventory, error) {
 		return nil
 	})
 
-	g.Go(func() error {
+	goSafe(g, func() error {
 		lm := license.NewManager(c)
 		infos, err := lm.List(gctx)
 		if err != nil {
@@ -115,7 +116,7 @@ func Collect(ctx context.Context, c *vim25.Client) (*Inventory, error) {
 	})
 
 	// VMs: list refs cheaply, then fetch heavy properties in parallel shards.
-	g.Go(func() error {
+	goSafe(g, func() error {
 		var stub []mo.VirtualMachine
 		m := view.NewManager(c)
 		v, err := m.CreateContainerView(gctx, root, []string{"VirtualMachine"}, true)
@@ -137,7 +138,7 @@ func Collect(ctx context.Context, c *vim25.Client) (*Inventory, error) {
 		for i := range shards {
 			i := i
 			lo, hi := i*vmChunk, min((i+1)*vmChunk, len(refs))
-			sg.Go(func() error {
+			goSafe(sg, func() error {
 				return pc.Retrieve(sctx, refs[lo:hi], vmProps, &shards[i])
 			})
 		}
@@ -238,4 +239,18 @@ func (inv *Inventory) hostLoc(h *types.ManagedObjectReference) (host, dc, cluste
 	}
 	e := inv.Entities[*h]
 	return inv.hostName[*h], inv.datacenter(e.Parent), inv.cluster(e.Parent)
+}
+
+// goSafe runs f in the group, turning a panic in that goroutine into an error
+// (an unrecovered panic in any goroutine would otherwise kill the whole process).
+func goSafe(g *errgroup.Group, f func() error) {
+	g.Go(func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				writeCrashLog(r)
+				err = fmt.Errorf("internal error: %v", r)
+			}
+		}()
+		return f()
+	})
 }

@@ -108,8 +108,11 @@ func main() {
 // CollectAll connects, gathers the full inventory and builds the sheets.
 // Shared by the CLI and the GUI.
 func CollectAll(ctx context.Context, server, user, password string, insecure bool) (inv *Inventory, sheets []*Sheet, host string, tConn time.Duration, err error) {
-	err = safely(func() { inv, sheets, host, tConn, err = collectAll(ctx, server, user, password, insecure) })
-	return
+	var cerr error
+	if perr := safely(func() { inv, sheets, host, tConn, cerr = collectAll(ctx, server, user, password, insecure) }); perr != nil {
+		return nil, nil, "", 0, perr
+	}
+	return inv, sheets, host, tConn, cerr
 }
 
 func collectAll(ctx context.Context, server, user, password string, insecure bool) (inv *Inventory, sheets []*Sheet, host string, tConn time.Duration, err error) {
@@ -205,4 +208,15 @@ func appDataDir() (string, error) {
 	probe.Close()
 	os.Remove(probe.Name())
 	return dir, nil
+}
+
+// captureFatalCrashes makes the Go runtime write fatal errors / unrecovered panics
+// (from any goroutine) to crash.log; the GUI build has no console to show them on.
+func captureFatalCrashes(dir string) {
+	f, err := os.OpenFile(filepath.Join(dir, "crash.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(f, "---- session started %s\n", time.Now().Format(time.RFC3339))
+	debug.SetCrashOutput(f, debug.CrashOptions{})
 }
