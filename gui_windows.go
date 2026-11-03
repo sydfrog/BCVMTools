@@ -217,11 +217,18 @@ var (
 )
 
 type settings struct {
+	Server string      `json:"server"`
+	User   string      `json:"user"`
+	Verify bool        `json:"verifyTLS"`
+	Width  int         `json:"width"`
+	Height int         `json:"height"`
+	Extra  []savedConn `json:"extra,omitempty"` // additional vCenters (never passwords)
+}
+
+type savedConn struct {
 	Server string `json:"server"`
 	User   string `json:"user"`
-	Verify bool   `json:"verifyTLS"`
-	Width  int    `json:"width"`
-	Height int    `json:"height"`
+	Source string `json:"source"`
 }
 
 func settingsPath() string {
@@ -341,6 +348,15 @@ func runGUI() error {
 	}
 	captureFatalCrashes(dir)
 	set := loadSettings()
+	var extra []Conn
+	for _, s := range set.Extra {
+		extra = append(extra, Conn{Server: s.Server, User: s.User, Source: s.Source})
+	}
+	if env := os.Getenv("BCVMTOOLS_EXTRA"); env != "" { // test hook: comma separated hosts
+		for _, h := range strings.Split(env, ",") {
+			extra = append(extra, Conn{Server: strings.TrimSpace(h), Source: "Manual"})
+		}
+	}
 	if set.Width < 1000 || set.Height < 600 {
 		set.Width, set.Height = 1360, 820
 	}
@@ -382,6 +398,10 @@ func runGUI() error {
 	if uiBold != nil {
 		collectBtn.SetFont(uiBold)
 	}
+	moreBox := box(gb, vbox(walk.Margins{}, 3))
+	sp3, _ := walk.NewLabel(moreBox)
+	sp3.SetText(" ")
+	moreBtn := button(moreBox, "More vCenters / VCF...", "Collect from several vCenters at once, or discover them from a VCF SDDC Manager", 170)
 	walk.NewHSpacer(gb)
 
 	progress, _ := walk.NewProgressBar(mw)
@@ -657,52 +677,107 @@ func runGUI() error {
 		gb.SetEnabled(true)
 		progress.SetVisible(false)
 	}
-	finish := func(inv *Inventory, ss []*Sheet, err error, t0 time.Time) {
+	finish := func(ss []*Sheet, results []ConnResult, t0 time.Time) {
 		endBusy()
-		if err != nil {
-			setStatus("Failed: " + err.Error())
-			walk.MsgBox(mw, "Collection failed", err.Error(), walk.MsgBoxIconError)
-			return
+		ok, vms, hosts := 0, 0, 0
+		var failed []string
+		for _, r := range results {
+			if r.OK {
+				ok++
+				vms += r.VMs
+				hosts += r.Hosts
+			} else {
+				failed = append(failed, r.Label+": "+r.Error)
+			}
 		}
-		if len(ss) == 0 {
-			setStatus("Nothing was collected.")
-			walk.MsgBox(mw, "Collection failed", "The server returned no inventory data.", walk.MsgBoxIconWarning)
+		if ok == 0 || len(ss) == 0 {
+			msg := "Could not collect from any vCenter:\n\n" + strings.Join(failed, "\n")
+			setStatus("Failed: " + strings.Join(failed, "; "))
+			walk.MsgBox(mw, "Collection failed", msg, walk.MsgBoxIconError)
 			return
 		}
 		showSheets(ss)
-		msg := fmt.Sprintf("Collected %d VMs, %d hosts, %d datastores in %s. Review the tabs, then export.",
-			len(inv.VMs), len(inv.Hosts), len(inv.DS), time.Since(t0).Round(time.Millisecond))
-		if len(inv.Warnings) > 0 {
-			msg += fmt.Sprintf(" (%d warnings, first: %s)", len(inv.Warnings), inv.Warnings[0])
-		}
+		msg := fmt.Sprintf("Collected %d of %d vCenter(s): %d VMs, %d hosts in %s. Review the tabs, then export.",
+			ok, len(results), vms, hosts, time.Since(t0).Round(time.Millisecond))
 		setStatus(msg)
 		if i := curIdx(); i >= 0 {
 			cntItem.SetText(fmt.Sprintf("%s: %d of %d rows shown", models[i].sheet.Name, len(models[i].view), len(models[i].sheet.Rows)))
 		}
+		if len(failed) > 0 {
+			walk.MsgBox(mw, "Some vCenters failed", fmt.Sprintf("%d of %d vCenter(s) could not be collected (details are on the vCenters tab):\n\n%s",
+				len(failed), len(results), strings.Join(failed, "\n")), walk.MsgBoxIconWarning)
+		}
 	}
+	savePrefs := func() {
+		b := mw.BoundsPixels()
+		s := settings{Server: strings.TrimSpace(server.Text()), User: strings.TrimSpace(user.Text()), Verify: verify.Checked(), Width: b.Width, Height: b.Height}
+		for _, c := range extra {
+			s.Extra = append(s.Extra, savedConn{Server: c.Server, User: c.User, Source: c.Source})
+		}
+		saveSettings(s)
+	}
+	updateMore := func() {
+		if len(extra) == 0 {
+			moreBtn.SetText("More vCenters / VCF...")
+		} else {
+			moreBtn.SetText(fmt.Sprintf("More vCenters / VCF (%d)...", len(extra)))
+		}
+	}
+	updateMore()
+	moreBtn.Clicked().Attach(func() {
+		connectionsDialog(mw, &extra, !verify.Checked())
+		updateMore()
+		savePrefs()
+	})
 	doCollect := func() {
 		if busy {
 			return
 		}
-		if strings.TrimSpace(server.Text()) == "" || strings.TrimSpace(user.Text()) == "" {
-			walk.MsgBox(mw, "Connection", "Please enter the server and user name.", walk.MsgBoxIconWarning)
+		srv, usr, pw, ins := strings.TrimSpace(server.Text()), strings.TrimSpace(user.Text()), pass.Text(), !verify.Checked()
+		var targets []Target
+		if srv != "" {
+			if usr == "" {
+				walk.MsgBox(mw, "Connection", "Please enter the user name.", walk.MsgBoxIconWarning)
+				return
+			}
+			targets = append(targets, Target{Server: srv, User: usr, Password: pw, Source: "Manual", Insecure: ins})
+		}
+		for _, c := range extra {
+			t := Target{Server: c.Server, User: firstNonEmpty(c.User, usr), Password: firstNonEmpty(c.Password, pw), Source: c.Source, Insecure: ins}
+			if t.User == "" {
+				walk.MsgBox(mw, "Connection", "No user name for "+c.Server+". Enter one in the main window or in the vCenter list.", walk.MsgBoxIconWarning)
+				return
+			}
+			targets = append(targets, t)
+		}
+		targets = dedupeTargets(targets)
+		if len(targets) == 0 {
+			walk.MsgBox(mw, "Connection", "Please enter a vCenter or ESXi host (or add some with 'More vCenters / VCF').", walk.MsgBoxIconWarning)
 			return
 		}
-		srv, usr, pw, ins := strings.TrimSpace(server.Text()), strings.TrimSpace(user.Text()), pass.Text(), !verify.Checked()
-		saveSettings(settings{Server: srv, User: usr, Verify: verify.Checked(), Width: mw.BoundsPixels().Width, Height: mw.BoundsPixels().Height})
+		savePrefs()
 		busy = true
 		collectBtn.SetEnabled(false)
 		gb.SetEnabled(false)
 		progress.SetVisible(true)
-		setStatus("Connecting to " + srv + " and collecting...")
+		if len(targets) == 1 {
+			setStatus("Connecting to " + vcLabel(targets[0].Server) + " and collecting...")
+		} else {
+			setStatus(fmt.Sprintf("Connecting to %d vCenters and collecting in parallel...", len(targets)))
+		}
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
 			t0 := time.Now()
-			inv, ss, _, _, err := CollectAll(ctx, srv, usr, pw, ins) // recovers panics into err
+			var ss []*Sheet
+			var results []ConnResult
+			perr := safely(func() { ss, results = CollectMany(ctx, targets) }) // each vCenter also recovers on its own
 			mw.Synchronize(func() {
 				// showing the results must not be able to kill the app either
-				if perr := safely(func() { finish(inv, ss, err, t0) }); perr != nil {
+				if perr == nil {
+					perr = safely(func() { finish(ss, results, t0) })
+				}
+				if perr != nil {
 					endBusy()
 					setStatus(perr.Error())
 					walk.MsgBox(mw, "Unexpected error", perr.Error(), walk.MsgBoxIconError)
@@ -774,10 +849,7 @@ func runGUI() error {
 	sw, sh := int(win.GetSystemMetrics(win.SM_CXSCREEN)), int(win.GetSystemMetrics(win.SM_CYSCREEN))
 	w, h := min(set.Width, sw-40), min(set.Height, sh-80)
 	mw.SetBoundsPixels(walk.Rectangle{X: (sw - w) / 2, Y: (sh-h)/2 - 20, Width: w, Height: h})
-	mw.Closing().Attach(func(*bool, walk.CloseReason) {
-		b := mw.BoundsPixels()
-		saveSettings(settings{Server: strings.TrimSpace(server.Text()), User: strings.TrimSpace(user.Text()), Verify: verify.Checked(), Width: b.Width, Height: b.Height})
-	})
+	mw.Closing().Attach(func(*bool, walk.CloseReason) { savePrefs() })
 	if strings.TrimSpace(server.Text()) == "" {
 		server.SetFocus()
 	} else {
@@ -794,13 +866,4 @@ func runGUI() error {
 	mw.Show()
 	mw.Run()
 	return nil
-}
-
-func firstNonEmpty(v ...string) string {
-	for _, s := range v {
-		if s != "" {
-			return s
-		}
-	}
-	return ""
 }

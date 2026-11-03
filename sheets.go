@@ -265,7 +265,7 @@ func BuildSheets(inv *Inventory, server string) []*Sheet {
 		hostSheet(inv), clusterSheet(inv), rpSheet(inv), dsSheet(inv)}
 	sheets = append(sheets, hostNetSheets(inv)...)
 	sheets = append(sheets, dvSheets(inv)...)
-	sheets = append(sheets, licenseSheet(inv), sourceSheet(inv, server))
+	sheets = append(sheets, licenseSheet(inv))
 	for _, h := range inv.Hosts {
 		if h.OverallStatus != types.ManagedEntityStatusGreen && h.OverallStatus != types.ManagedEntityStatusGray {
 			vHealth.Rows = append(vHealth.Rows, []any{h.Name, "HostSystem", string(h.OverallStatus), "", ""})
@@ -279,6 +279,7 @@ func BuildSheets(inv *Inventory, server string) []*Sheet {
 	sheets = append(sheets, vHealth)
 	for _, sh := range sheets {
 		sh.Name = tabName(sh.Name)
+		tagVCenter(sh, server) // every row records which vCenter it came from
 	}
 	return sheets
 }
@@ -563,12 +564,6 @@ func licenseSheet(inv *Inventory) *Sheet {
 		}()
 	}
 	return s
-}
-
-func sourceSheet(inv *Inventory, server string) *Sheet {
-	a := inv.About
-	return &Sheet{Name: "vSource", Header: []string{"Server", "Name", "Version", "Build", "OS Type", "API type", "API version", "Instance UUID", "Collected"},
-		Rows: [][]any{{server, a.FullName, a.Version, a.Build, a.OsType, a.ApiType, a.ApiVersion, a.InstanceUuid, time.Now().Format("2006-01-02 15:04:05")}}}
 }
 
 var _ = mo.VirtualMachine{}

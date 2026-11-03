@@ -5,7 +5,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vmware/govmomi"
 	"golang.org/x/term"
 )
 
@@ -27,13 +25,16 @@ func main() {
 		}
 	}()
 	var (
-		server   = flag.String("s", os.Getenv("VI_SERVER"), "vCenter/ESXi host or URL (env VI_SERVER)")
+		server   = flag.String("s", os.Getenv("VI_SERVER"), "vCenter/ESXi host(s) or URL(s), comma separated (env VI_SERVER)")
 		user     = flag.String("u", os.Getenv("VI_USER"), "username (env VI_USER)")
 		pass     = flag.String("p", "", "password (env VI_PASSWORD; prompts if omitted)")
 		insecure = flag.Bool("insecure", true, "skip TLS certificate verification")
 		out      = flag.String("o", "", "output path (default bcvmtools_<server>_<timestamp>.xlsx, or a directory for csv)")
 		format   = flag.String("f", "xlsx", "output format: xlsx | csv")
 		timeout  = flag.Duration("timeout", 10*time.Minute, "overall timeout")
+		vcf      = flag.String("vcf", "", "VCF SDDC Manager host: discover and collect from all its vCenters (uses -u/-p)")
+		vcUser   = flag.String("vcuser", "", "user for the discovered vCenters (default: same as -u)")
+		vcPass   = flag.String("vcpass", "", "password for the discovered vCenters (default: same as -p)")
 		showVer  = flag.Bool("version", false, "print version")
 	)
 	gui := flag.Bool("gui", false, "open the graphical interface (default when started without arguments on Windows)")
@@ -52,7 +53,7 @@ func main() {
 		fmt.Println("bcvmtools", version)
 		return
 	}
-	if *server == "" || *user == "" {
+	if (*server == "" && *vcf == "") || *user == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -73,14 +74,46 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 	start := time.Now()
-	inv, sheets, host, tConn, err := CollectAll(ctx, *server, *user, password, *insecure)
-	if err != nil {
-		fatal(err)
+	var targets []Target
+	for _, s := range strings.Split(*server, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			targets = append(targets, Target{Server: s, User: *user, Password: password, Source: "Manual", Insecure: *insecure})
+		}
 	}
-	tCollect := time.Since(start)
-	for _, w := range inv.Warnings {
-		fmt.Fprintln(os.Stderr, "warning:", w)
+	if *vcf != "" {
+		vcs, err := DiscoverVCF(ctx, *vcf, *user, password, *insecure)
+		if err != nil {
+			fatal(err)
+		}
+		vu, vp := firstNonEmpty(*vcUser, *user), firstNonEmpty(*vcPass, password)
+		for _, v := range vcs {
+			targets = append(targets, Target{Server: v.FQDN, User: vu, Password: vp, Source: "VCF: " + *vcf + " / " + v.Domain, Insecure: *insecure})
+		}
+		fmt.Fprintf(os.Stderr, "VCF %s: found %d vCenter(s)\n", *vcf, len(vcs))
 	}
+	targets = dedupeTargets(targets)
+	sheets, results := CollectMany(ctx, targets)
+	ok, vms, hosts := 0, 0, 0
+	for _, r := range results {
+		if r.OK {
+			ok++
+			vms += r.VMs
+			hosts += r.Hosts
+		} else {
+			fmt.Fprintf(os.Stderr, "FAILED %s: %s\n", r.Label, r.Error)
+		}
+		for _, w := range r.Warnings {
+			fmt.Fprintf(os.Stderr, "warning (%s): %s\n", r.Label, w)
+		}
+	}
+	if ok == 0 {
+		fatal(fmt.Errorf("could not collect from any vCenter"))
+	}
+	host := results[0].Label
+	if len(results) > 1 {
+		host = fmt.Sprintf("%d-vcenters", len(results))
+	}
+	var err error
 
 	name := *out
 	if name == "" {
@@ -100,45 +133,30 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	fmt.Printf("%d VMs, %d hosts, %d datastores -> %s (connect %s, collect %s, total %s)\n",
-		len(inv.VMs), len(inv.Hosts), len(inv.DS), name,
-		tConn.Round(time.Millisecond), (tCollect - tConn).Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
+	fmt.Printf("%d/%d vCenters, %d VMs, %d hosts -> %s (total %s)\n", ok, len(results), vms, hosts, name, time.Since(start).Round(time.Millisecond))
 }
 
-// CollectAll connects, gathers the full inventory and builds the sheets.
-// Shared by the CLI and the GUI.
-func CollectAll(ctx context.Context, server, user, password string, insecure bool) (inv *Inventory, sheets []*Sheet, host string, tConn time.Duration, err error) {
-	var cerr error
-	if perr := safely(func() { inv, sheets, host, tConn, cerr = collectAll(ctx, server, user, password, insecure) }); perr != nil {
-		return nil, nil, "", 0, perr
+// dedupeTargets drops repeated servers (same vCenter given twice, or found by VCF and also typed).
+func dedupeTargets(in []Target) []Target {
+	seen := map[string]bool{}
+	var out []Target
+	for _, t := range in {
+		k := strings.ToLower(vcLabel(t.Server))
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, t)
+		}
 	}
-	return inv, sheets, host, tConn, cerr
+	return out
 }
 
-func collectAll(ctx context.Context, server, user, password string, insecure bool) (inv *Inventory, sheets []*Sheet, host string, tConn time.Duration, err error) {
-	start := time.Now()
-	u, err := parseServer(server)
-	if err != nil {
-		return
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if s != "" {
+			return s
+		}
 	}
-	u.User = url.UserPassword(user, password)
-	c, err := govmomi.NewClient(ctx, u, insecure)
-	if err != nil {
-		err = fmt.Errorf("connect: %w", err)
-		return
-	}
-	defer c.Logout(context.Background())
-	if t, ok := c.Client.Client.Transport.(*http.Transport); ok {
-		t.MaxIdleConnsPerHost = 32
-	}
-	tConn = time.Since(start)
-	if inv, err = Collect(ctx, c.Client); err != nil {
-		err = fmt.Errorf("collect: %w", err)
-		return
-	}
-	host = u.Host
-	sheets = BuildSheets(inv, host)
-	return
+	return ""
 }
 
 func parseServer(s string) (*url.URL, error) {

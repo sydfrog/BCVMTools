@@ -27,7 +27,7 @@ func TestEndToEnd(t *testing.T) {
 		for _, s := range sheets {
 			t.Logf("%-12s %5d rows", s.Name, len(s.Rows))
 			for i, r := range s.Rows {
-				if len(r) != len(s.Header) && !(s.Name == "Info" && len(r) == 6) {
+				if len(r) != len(s.Header) && !(s.Name == "Info" && len(r) == 7) {
 					t.Fatalf("%s row %d: %d cols, header %d", s.Name, i, len(r), len(s.Header))
 				}
 			}

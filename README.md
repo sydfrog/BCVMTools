@@ -26,10 +26,26 @@ bcvmtools -s esxi01 -u root -f csv -o ./out                              # one C
 Env vars `VI_SERVER`, `VI_USER`, `VI_PASSWORD` are honoured. Certificate checks are skipped by
 default (`-insecure=false` to enforce). A read-only vCenter role is enough.
 
+## Several vCenters / VCF
+
+Every row on every tab has a **vCenter** column (first column) naming the vCenter it came from, and a
+**vCenters** tab (first tab) lists each connection: status, source, version, build, counts, time and any error.
+
+* **GUI:** the main form collects from one vCenter as before. Press **More vCenters / VCF...** to add more
+  vCenters (blank user/password fall back to the main window's) or to enter an **SDDC Manager** host, which
+  discovers every vCenter it manages. All vCenters are collected in parallel; one failing does not stop the
+  others. Server names and users are remembered between runs (never passwords).
+* **CLI:** `-s a.corp,b.corp` collects several; `-vcf sddc.corp -u admin@vsphere.local` discovers the vCenters
+  of a VCF instance (`-vcuser/-vcpass` if the vCenters use different credentials).
+
+VCF discovery uses the SDDC Manager API (`POST /v1/tokens`, `GET /v1/vcenters`, falling back to `/v1/domains`)
+and then logs in to each vCenter with the given credentials. It is covered by tests against a mock SDDC Manager,
+not yet against a real VCF.
+
 ## Tabs
 
-Info, CPU, Memory, Disk, Partition, Network, Snapshot, Tools, CD, Host, Cluster, RP, Datastore,
-Switch, Port, SC_VMK, NIC, HBA, dvSwitch, dvPort, License, Source, Health.
+vCenters, Info, CPU, Memory, Disk, Partition, Network, Snapshot, Tools, CD, Host, Cluster, RP, Datastore,
+Switch, Port, SC_VMK, NIC, HBA, dvSwitch, dvPort, License, Health.
 
 Host includes `Cores per CPU` and `Licensable cores` = sockets x max(16, cores per socket).
 
