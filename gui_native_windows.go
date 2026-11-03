@@ -3,8 +3,11 @@
 package main
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/lxn/walk"
@@ -212,6 +215,9 @@ func headerOf(tv *walk.TableView) win.HWND {
 
 // hookHeader subclasses the table so its header is custom drawn and reports arrow / right clicks.
 func hookHeader(tv *walk.TableView, hk headerHooks) {
+	if safeUI {
+		return
+	}
 	h, hdr := listViewOf(tv)
 	if h == 0 {
 		return
@@ -293,4 +299,125 @@ func columnPickMenu(owner win.HWND, names []string, filtered []bool) int {
 	win.GetCursorPos(&pt)
 	r := int(win.TrackPopupMenuEx(hm, win.TPM_RETURNCMD|win.TPM_LEFTALIGN|win.TPM_TOPALIGN, pt.X, pt.Y, owner, nil))
 	return r - 1
+}
+
+// ---- hang diagnostics ------------------------------------------------------------------------
+
+var (
+	k32                 = syscall.NewLazyDLL("kernel32.dll")
+	ntdll               = syscall.NewLazyDLL("ntdll.dll")
+	pOpenThread         = k32.NewProc("OpenThread")
+	pSuspendThread      = k32.NewProc("SuspendThread")
+	pResumeThread       = k32.NewProc("ResumeThread")
+	pGetThreadContext   = k32.NewProc("GetThreadContext")
+	pGetThreadTimes     = k32.NewProc("GetThreadTimes")
+	pCloseHandle        = k32.NewProc("CloseHandle")
+	pGetModuleHandleEx  = k32.NewProc("GetModuleHandleExW")
+	pGetModuleFileName  = k32.NewProc("GetModuleFileNameW")
+	pGetCurrentThreadID = k32.NewProc("GetCurrentThreadId")
+	pGetGuiResources    = user32.NewProc("GetGuiResources")
+	pRtlLookupFunction  = ntdll.NewProc("RtlLookupFunctionEntry")
+	pRtlVirtualUnwind   = ntdll.NewProc("RtlVirtualUnwind")
+	pRtlGetVersion      = ntdll.NewProc("RtlGetVersion")
+)
+
+func currentThreadID() uint32 {
+	id, _, _ := pGetCurrentThreadID.Call()
+	return uint32(id)
+}
+
+// sampleStack suspends the given thread for a moment and unwinds its native stack (amd64),
+// returning raw instruction pointers. No Go allocation happens while the thread is suspended.
+func sampleStack(h uintptr, frames *[24]uintptr, ctxBuf *[1232 + 16]byte) int {
+	off := int((16 - uintptr(unsafe.Pointer(&ctxBuf[0]))%16) % 16) // CONTEXT must be 16-byte aligned
+	cp := unsafe.Pointer(&ctxBuf[off])
+	ctx := uintptr(cp)
+	*(*uint32)(unsafe.Add(cp, 0x30)) = 0x100003 // CONTEXT_CONTROL | CONTEXT_INTEGER
+	if r, _, _ := pSuspendThread.Call(h); r == ^uintptr(0) {
+		return 0
+	}
+	n := 0
+	if r, _, _ := pGetThreadContext.Call(h, ctx); r != 0 {
+		for n < len(frames) {
+			rip := *(*uint64)(unsafe.Add(cp, 0xF8))
+			if rip == 0 {
+				break
+			}
+			frames[n] = uintptr(rip)
+			n++
+			var imageBase uint64
+			fe, _, _ := pRtlLookupFunction.Call(uintptr(rip), uintptr(unsafe.Pointer(&imageBase)), 0)
+			if fe == 0 {
+				break // no unwind info (Go frames, or the end of the stack)
+			}
+			var handlerData uintptr
+			var establisher uint64
+			pRtlVirtualUnwind.Call(0, uintptr(imageBase), uintptr(rip), fe, ctx,
+				uintptr(unsafe.Pointer(&handlerData)), uintptr(unsafe.Pointer(&establisher)), 0)
+		}
+	}
+	pResumeThread.Call(h)
+	return n
+}
+
+func moduleOf(addr uintptr) string {
+	var hmod uintptr
+	if r, _, _ := pGetModuleHandleEx.Call(6, addr, uintptr(unsafe.Pointer(&hmod))); r == 0 { // FROM_ADDRESS | UNCHANGED_REFCOUNT
+		return fmt.Sprintf("0x%x", addr)
+	}
+	var buf [260]uint16
+	pGetModuleFileName.Call(hmod, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	name := syscall.UTF16ToString(buf[:])
+	if i := strings.LastIndexAny(name, `\/`); i >= 0 {
+		name = name[i+1:]
+	}
+	return fmt.Sprintf("%s+0x%x", name, addr-hmod)
+}
+
+func threadCPU(h uintptr) (ms int64) {
+	var c, e, k, u [2]uint32
+	if r, _, _ := pGetThreadTimes.Call(h, uintptr(unsafe.Pointer(&c)), uintptr(unsafe.Pointer(&e)), uintptr(unsafe.Pointer(&k)), uintptr(unsafe.Pointer(&u))); r == 0 {
+		return -1
+	}
+	ft := func(v [2]uint32) int64 { return (int64(v[1])<<32 | int64(v[0])) / 10000 }
+	return ft(k) + ft(u)
+}
+
+// uiHangReport describes what the (hung) UI thread is doing: CPU use over a couple of seconds
+// (spinning vs blocked), three native stack samples, and the process's GDI/USER object counts.
+func uiHangReport(tid uint32) string {
+	var sb strings.Builder
+	if tid == 0 {
+		return "UI thread id unknown\n"
+	}
+	h, _, _ := pOpenThread.Call(0x0002|0x0008|0x0040, 0, uintptr(tid)) // SUSPEND_RESUME | GET_CONTEXT | QUERY_INFORMATION
+	if h == 0 {
+		return "could not open the UI thread\n"
+	}
+	defer pCloseHandle.Call(h)
+	proc, _, _ := syscall.NewLazyDLL("kernel32.dll").NewProc("GetCurrentProcess").Call()
+	gdi, _, _ := pGetGuiResources.Call(proc, 0)
+	usr, _, _ := pGetGuiResources.Call(proc, 1)
+	var ver [5]uint32 // OSVERSIONINFOW head: size, major, minor, build, platform
+	ver[0] = 276
+	vbuf := make([]byte, 276)
+	*(*uint32)(unsafe.Pointer(&vbuf[0])) = 276
+	pRtlGetVersion.Call(uintptr(unsafe.Pointer(&vbuf[0])))
+	fmt.Fprintf(&sb, "windows %d.%d build %d; GDI objects %d, USER objects %d (limit about 10000)\n",
+		*(*uint32)(unsafe.Pointer(&vbuf[4])), *(*uint32)(unsafe.Pointer(&vbuf[8])), *(*uint32)(unsafe.Pointer(&vbuf[12])), gdi, usr)
+
+	cpu0 := threadCPU(h)
+	var ctx [1232 + 16]byte
+	for s := 0; s < 3; s++ {
+		var frames [24]uintptr
+		n := sampleStack(h, &frames, &ctx)
+		fmt.Fprintf(&sb, "native stack sample %d (%d frames):\n", s+1, n)
+		for i := 0; i < n; i++ {
+			fmt.Fprintf(&sb, "    %s\n", moduleOf(frames[i]))
+		}
+		time.Sleep(time.Second)
+	}
+	cpu1 := threadCPU(h)
+	fmt.Fprintf(&sb, "UI thread CPU time used during the 3s sampling: %d ms (about 3000 = spinning, about 0 = blocked/waiting)\n", cpu1-cpu0)
+	return sb.String()
 }

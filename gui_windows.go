@@ -113,6 +113,9 @@ func (m *sheetModel) ClearFilters() {
 
 // StyleCell shades every second row (zebra striping) to make wide tables easier to read.
 func (m *sheetModel) StyleCell(st *walk.CellStyle) {
+	if safeUI {
+		return
+	}
 	if st.Row()%2 == 1 {
 		st.BackgroundColor = walk.RGB(236, 242, 249)
 	}
@@ -340,7 +343,11 @@ func field(parent walk.Container, caption string, width int, password bool, valu
 	return e
 }
 
-var uiLog *os.File
+var (
+	uiLog      *os.File
+	uiThreadID uint32
+	safeUI     bool // -safe: no custom-drawn headings / header hooks / zebra striping
+)
 
 // tracef writes a timestamped line to %AppData%\BCVMTools\ui.log (and to stderr when BCVMTOOLS_TRACE is set).
 // The log is recreated at every start and is only a few lines per action.
@@ -370,6 +377,11 @@ func runGUI() error {
 	}
 	captureFatalCrashes(dir)
 	uiLog, _ = os.Create(filepath.Join(dir, "ui.log"))
+	uiThreadID = currentThreadID()
+	if _, err := os.Stat(filepath.Join(dir, "safe.txt")); err == nil || os.Getenv("BCVMTOOLS_SAFE") != "" {
+		safeUI = true
+	}
+	tracef("safe mode: %v", safeUI)
 	tracef("started")
 	set := loadSettings()
 	var extra []Conn
@@ -522,7 +534,7 @@ func runGUI() error {
 	}
 	// (re)apply the header arrows and repaint headings (filtered columns are drawn amber)
 	decorate := func(i int) {
-		if views[i] == nil {
+		if views[i] == nil || safeUI {
 			return
 		}
 		markHeaderButtons(views[i], len(cols[i]))
@@ -682,7 +694,9 @@ func runGUI() error {
 			tv.Columns().Add(c)
 			tcols = append(tcols, c)
 		}
-		tv.SetCellStyler(m)
+		if !safeUI {
+			tv.SetCellStyler(m) // zebra striping
+		}
 		hookHeader(tv, headerHooks{
 			onDropdown: func(col int) { mw.Synchronize(func() { openColumnFilter(i, col) }) },
 			onContext: func(col int, x, y int32) {
@@ -704,7 +718,9 @@ func runGUI() error {
 		m.quiet = false
 		tv.SetMultiSelection(true) // after SetModel: selection clearing is much cheaper on a single-select list
 		cols[i], views[i] = tcols, tv
-		markHeaderButtons(tv, len(tcols))
+		if !safeUI {
+			markHeaderButtons(tv, len(tcols))
+		}
 		tracef("built tab %-10s rows=%6d in %s", s.Name, len(s.Rows), time.Since(t0).Round(time.Millisecond))
 	}
 	ensureBuilt := func(i int) {
@@ -1017,6 +1033,18 @@ func runGUI() error {
 		}()
 	}
 	startUIWatchdog(mw, dir)
+	if kind := os.Getenv("BCVMTOOLS_TEST_HANG"); kind != "" { // test hook: freeze the UI thread to exercise the watchdog
+		go func() {
+			time.Sleep(2 * time.Second)
+			mw.Synchronize(func() {
+				if kind == "native" {
+					walk.MsgBox(mw, "test", "native modal loop", walk.MsgBoxIconInformation)
+				} else {
+					time.Sleep(20 * time.Second)
+				}
+			})
+		}()
+	}
 	mw.Show()
 	mw.Run()
 	return nil
@@ -1040,6 +1068,7 @@ func startUIWatchdog(mw *walk.MainWindow, dir string) {
 			if f, err := os.OpenFile(filepath.Join(dir, "crash.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
 				fmt.Fprintf(f, "---- UI HANG detected %s (no response for 8s)\n", time.Now().Format(time.RFC3339))
 				pprof.Lookup("goroutine").WriteTo(f, 2)
+				fmt.Fprintf(f, "---- native diagnostics\n%s", uiHangReport(uiThreadID))
 				f.Close()
 			}
 			start := time.Now()

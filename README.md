@@ -26,6 +26,14 @@ bcvmtools -s esxi01 -u root -f csv -o ./out                              # one C
 Env vars `VI_SERVER`, `VI_USER`, `VI_PASSWORD` are honoured. Certificate checks are skipped by
 default (`-insecure=false` to enforce). A read-only vCenter role is enough.
 
+## If the window ever hangs
+
+The app watches itself: if the window stops responding for 8 seconds it writes a diagnosis (Go stacks, the native
+Windows call stack with DLL names, CPU use, GDI/USER object counts) to `%AppData%\BCVMTools\crash.log`, and
+`%AppData%\BCVMTools\ui.log` records each UI step. **Safe mode** (`bcvmtools.exe -safe`, or create an empty file
+`safe.txt` in `%AppData%\BCVMTools`) turns off the custom-drawn headings, header arrows/right-click menu and row
+striping, leaving the plain Windows controls (sorting and *Filter column...* still work).
+
 ## Several vCenters / VCF
 
 Every row on every tab has a **vCenter** column (first column) naming the vCenter it came from, and a

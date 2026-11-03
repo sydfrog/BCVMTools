@@ -41,11 +41,16 @@ func main() {
 		showVer   = flag.Bool("version", false, "print version")
 	)
 	gui := flag.Bool("gui", false, "open the graphical interface (default when started without arguments on Windows)")
+	safe := flag.Bool("safe", false, "GUI safe mode: native headings, no custom drawing or header hooks (also: create safe.txt in %AppData%\\BCVMTools)")
 	attachConsole()
 	if len(os.Args) == 1 {
 		*gui = true
 	}
 	flag.Parse()
+	if *safe {
+		os.Setenv("BCVMTOOLS_SAFE", "1")
+		*gui = true
+	}
 	if *gui {
 		if err := runGUI(); err != nil {
 			fatal(err)
