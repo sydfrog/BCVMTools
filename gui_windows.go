@@ -32,6 +32,7 @@ type sheetModel struct {
 	query   string
 	filters map[int]map[string]bool // per-column allowed values (Excel-style); nil = no filter
 	sorted  bool
+	quiet   bool // true while the table is being attached: skip list-view resets (they are expensive)
 }
 
 func newSheetModel(s *Sheet) *sheetModel {
@@ -79,7 +80,11 @@ func (m *sheetModel) applyFilter() {
 			m.view = append(m.view, i)
 		}
 	}
-	m.PublishRowsReset()
+	if !m.quiet {
+		t := time.Now()
+		m.PublishRowsReset()
+		tracef("PublishRowsReset(%s, %d visible rows) took %s", m.sheet.Name, len(m.view), time.Since(t).Round(time.Millisecond))
+	}
 }
 
 func (m *sheetModel) Filtered() bool { return m.query != "" || len(m.filters) > 0 }
@@ -334,6 +339,12 @@ func field(parent walk.Container, caption string, width int, password bool, valu
 	return e
 }
 
+func tracef(f string, a ...any) {
+	if os.Getenv("BCVMTOOLS_TRACE") != "" {
+		fmt.Fprintf(os.Stderr, "TRACE "+f+"\n", a...)
+	}
+}
+
 func runGUI() error {
 	var (
 		sheets []*Sheet
@@ -482,12 +493,14 @@ func runGUI() error {
 	}
 	showWelcome()
 
+	var ensureBuiltFn func(int)
 	var (
-		views   []*walk.TableView
-		pages   []*walk.TabPage
-		cols    [][]*walk.TableViewColumn
-		syncing bool
-		loading bool
+		views      []*walk.TableView
+		pages      []*walk.TabPage
+		cols       [][]*walk.TableViewColumn
+		syncing    bool
+		loading    bool
+		generation int
 	)
 	curIdx := func() int {
 		i := tabs.CurrentIndex()
@@ -498,6 +511,9 @@ func runGUI() error {
 	}
 	// (re)apply the header arrows and repaint headings (filtered columns are drawn amber)
 	decorate := func(i int) {
+		if views[i] == nil {
+			return
+		}
 		markHeaderButtons(views[i], len(cols[i]))
 		repaintHeader(views[i])
 	}
@@ -522,20 +538,33 @@ func runGUI() error {
 		if i < 0 {
 			return
 		}
+		ensureBuiltFn(i)
 		syncing = true
 		filter.SetText(models[i].query)
 		syncing = false
 		decorate(i)
 		refreshCounts(i)
 	}
+	// Applying a filter resets the list view, which is slow on big tables: wait until typing pauses.
+	searchGen := 0
 	filter.TextChanged().Attach(func() {
 		if syncing {
 			return
 		}
-		if i := curIdx(); i >= 0 {
-			models[i].SetSearch(filter.Text())
-			refreshCounts(i)
-		}
+		searchGen++
+		gen := searchGen
+		go func() {
+			time.Sleep(250 * time.Millisecond)
+			mw.Synchronize(func() {
+				if gen != searchGen {
+					return
+				}
+				if i := curIdx(); i >= 0 {
+					models[i].SetSearch(filter.Text())
+					refreshCounts(i)
+				}
+			})
+		}()
 	})
 	tabs.CurrentIndexChanged().Attach(syncControls)
 	clearBtn.Clicked().Attach(func() {
@@ -590,6 +619,7 @@ func runGUI() error {
 	})
 	removeBtn.Clicked().Attach(func() {
 		if i := curIdx(); i >= 0 {
+			ensureBuiltFn(i)
 			sel := views[i].SelectedIndexes()
 			if len(sel) == 0 {
 				walk.MsgBox(mw, "Remove rows", "Select one or more rows first (Ctrl/Shift-click for several).", walk.MsgBoxIconInformation)
@@ -617,6 +647,81 @@ func runGUI() error {
 		}
 	})
 
+	// buildTab creates the (expensive) table view of one tab. Tabs are built lazily: the list view
+	// is slow to attach to large models, so building all of them in one go froze the window.
+	buildTab := func(i int) {
+		if i < 0 || i >= len(models) || views[i] != nil {
+			return
+		}
+		s, m, page := models[i].sheet, models[i], pages[i]
+		t0 := time.Now()
+		tv, _ := walk.NewTableView(page)
+		tv.SetColumnsOrderable(true)
+		if uiFont != nil {
+			tv.SetFont(uiFont)
+		}
+		var tcols []*walk.TableViewColumn
+		for ci, h := range s.Header {
+			c := walk.NewTableViewColumn()
+			c.SetTitle(h)
+			c.SetWidth(autoWidth(s, ci))
+			tv.Columns().Add(c)
+			tcols = append(tcols, c)
+		}
+		tv.SetCellStyler(m)
+		hookHeader(tv, headerHooks{
+			onDropdown: func(col int) { mw.Synchronize(func() { openColumnFilter(i, col) }) },
+			onContext: func(col int, x, y int32) {
+				mw.Synchronize(func() { openHeaderMenu(i, col, x, y) })
+			},
+			style: func(col int) (string, bool, int) {
+				sortDir := 0
+				if m.sorted && m.SortedColumn() == col {
+					sortDir = 1
+					if m.SortOrder() == walk.SortDescending {
+						sortDir = 2
+					}
+				}
+				return s.Header[col], m.filters[col] != nil, sortDir
+			},
+		})
+		m.quiet = true // attach without publishing resets; SetModel sets the item count itself
+		tv.SetModel(m)
+		m.quiet = false
+		tv.SetMultiSelection(true) // after SetModel: selection clearing is much cheaper on a single-select list
+		cols[i], views[i] = tcols, tv
+		markHeaderButtons(tv, len(tcols))
+		tracef("built tab %-10s rows=%6d in %s", s.Name, len(s.Rows), time.Since(t0).Round(time.Millisecond))
+	}
+	ensureBuilt := func(i int) {
+		if i < 0 || i >= len(models) || views[i] != nil {
+			return
+		}
+		if n := len(models[i].sheet.Rows); n > 1500 {
+			setStatus(fmt.Sprintf("Loading %s (%d rows)...", models[i].sheet.Name, n))
+		}
+		if perr := safely(func() { buildTab(i) }); perr != nil {
+			setStatus(perr.Error())
+		}
+	}
+	const prebuildMaxRows = 1500
+	// prebuild fills in the small tabs one at a time while the user looks at the first one.
+	// Each step is a separate message-loop turn, so the window stays responsive.
+	var prebuild func(g int)
+	prebuild = func(g int) {
+		if g != generation {
+			return
+		}
+		for i := range models {
+			if views[i] == nil && len(models[i].sheet.Rows) <= prebuildMaxRows {
+				ensureBuilt(i)
+				mw.Synchronize(func() { prebuild(g) })
+				return
+			}
+		}
+	}
+
+	ensureBuiltFn = ensureBuilt
 	showSheets := func(ss []*Sheet) {
 		// walk panics if a layout pass runs while the tab control has no pages, so the new
 		// pages are added first and the old ones removed afterwards.
@@ -626,63 +731,31 @@ func runGUI() error {
 		if len(ss) == 0 {
 			return // keep the current pages: walk panics on an empty tab control
 		}
+		generation++
 		sheets, models, views, pages, cols = ss, nil, nil, nil, nil
 		for _, s := range ss {
 			page, _ := walk.NewTabPage()
 			page.SetTitle(fmt.Sprintf("%s (%d)", s.Name, len(s.Rows)))
 			page.SetLayout(vbox(walk.Margins{HNear: 4, VNear: 4, HFar: 4, VFar: 4}, 0))
-			tv, _ := walk.NewTableView(page)
-			tv.SetColumnsOrderable(true)
-			if uiFont != nil {
-				tv.SetFont(uiFont)
-			}
-			tv.SetMultiSelection(true)
-			var tcols []*walk.TableViewColumn
-			for ci, h := range s.Header {
-				c := walk.NewTableViewColumn()
-				c.SetTitle(h)
-				c.SetWidth(autoWidth(s, ci))
-				tv.Columns().Add(c)
-				tcols = append(tcols, c)
-			}
-			m := newSheetModel(s)
-			tv.SetCellStyler(m)
-			idx := len(models)
-			hookHeader(tv, headerHooks{
-				onDropdown: func(col int) { mw.Synchronize(func() { openColumnFilter(idx, col) }) },
-				onContext: func(col int, x, y int32) {
-					mw.Synchronize(func() { openHeaderMenu(idx, col, x, y) })
-				},
-				style: func(col int) (string, bool, int) {
-					sortDir := 0
-					if m.sorted && m.SortedColumn() == col {
-						sortDir = 1
-						if m.SortOrder() == walk.SortDescending {
-							sortDir = 2
-						}
-					}
-					return s.Header[col], m.filters[col] != nil, sortDir
-				},
-			})
-			cols = append(cols, tcols)
-			models = append(models, m)
-			views = append(views, tv)
+			models = append(models, newSheetModel(s))
+			views = append(views, nil)
+			cols = append(cols, nil)
 			pages = append(pages, page)
-			tv.SetModel(m)
 			tabs.Pages().Add(page)
 		}
 		for i := 0; i < oldN; i++ {
 			tabs.Pages().RemoveAt(0)
 		}
-		if len(ss) > 0 {
-			tabs.SetCurrentIndex(0)
-		}
+		tabs.SetCurrentIndex(0)
 		for _, b := range allBtns {
 			b.SetEnabled(len(ss) > 0)
 		}
 		filter.SetEnabled(len(ss) > 0)
 		loading = false
+		ensureBuilt(0)
 		syncControls()
+		g := generation
+		mw.Synchronize(func() { prebuild(g) })
 	}
 
 	busy := false
@@ -717,7 +790,19 @@ func runGUI() error {
 			walk.MsgBox(mw, "Collection failed", msg, walk.MsgBoxIconError)
 			return
 		}
+		tShow := time.Now()
 		showSheets(ss)
+		tracef("showSheets returned after %s", time.Since(tShow).Round(time.Millisecond))
+		if n, err := strconv.Atoi(os.Getenv("BCVMTOOLS_SELECT_TAB")); err == nil { // test hook
+			mw.Synchronize(func() {
+				t := time.Now()
+				tabs.SetCurrentIndex(n)
+				tracef("selected tab %d in %s", n, time.Since(t).Round(time.Millisecond))
+				if q := os.Getenv("BCVMTOOLS_TEST_FILTER"); q != "" {
+					filter.SetText(q)
+				}
+			})
+		}
 		msg := fmt.Sprintf("Collected %d of %d vCenter(s): %d VMs, %d hosts in %s. Review the tabs, then export.",
 			ok, len(results), vms, hosts, time.Since(t0).Round(time.Millisecond))
 		setStatus(msg)
