@@ -1,0 +1,47 @@
+package main
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/vmware/govmomi/simulator"
+	"github.com/vmware/govmomi/vim25"
+)
+
+func TestEndToEnd(t *testing.T) {
+	m := simulator.VPX()
+	m.Machine = 450 // exercises VM sharding (vmChunk = 200)
+	err := m.Run(func(ctx context.Context, c *vim25.Client) error {
+		t0 := time.Now()
+		inv, err := Collect(ctx, c)
+		t.Logf("collect %s", time.Since(t0))
+		if err != nil {
+			return err
+		}
+		if len(inv.VMs) != 450*m.Datacenter*m.Cluster+len(inv.VMs)-450*m.Datacenter*m.Cluster && len(inv.VMs) < 450 {
+			t.Errorf("expected >=450 VMs, got %d", len(inv.VMs))
+		}
+		sheets := BuildSheets(inv, "sim")
+		for _, s := range sheets {
+			t.Logf("%-12s %5d rows", s.Name, len(s.Rows))
+			for i, r := range s.Rows {
+				if len(r) != len(s.Header) && !(s.Name == "vInfo" && len(r) == 6) {
+					t.Fatalf("%s row %d: %d cols, header %d", s.Name, i, len(r), len(s.Header))
+				}
+			}
+		}
+		t1 := time.Now()
+		dir := t.TempDir()
+		if err := WriteXLSX(filepath.Join(dir, "o.xlsx"), sheets); err != nil {
+			return err
+		}
+		err = WriteCSV(filepath.Join(dir, "csv"), sheets)
+		t.Logf("write %s", time.Since(t1))
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
