@@ -1068,6 +1068,7 @@ func startUIWatchdog(mw *walk.MainWindow, dir string) {
 			if f, err := os.OpenFile(filepath.Join(dir, "crash.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
 				fmt.Fprintf(f, "---- UI HANG detected %s (no response for 8s)\n", time.Now().Format(time.RFC3339))
 				pprof.Lookup("goroutine").WriteTo(f, 2)
+				fmt.Fprintf(f, "---- most recent window messages (newest last)\n%s", walk.RecentMessages())
 				fmt.Fprintf(f, "---- native diagnostics\n%s", uiHangReport(uiThreadID))
 				f.Close()
 			}
