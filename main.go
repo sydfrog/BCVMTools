@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/vmware/govmomi"
@@ -29,7 +28,18 @@ func main() {
 		timeout  = flag.Duration("timeout", 10*time.Minute, "overall timeout")
 		showVer  = flag.Bool("version", false, "print version")
 	)
+	gui := flag.Bool("gui", false, "open the graphical interface (default when started without arguments on Windows)")
+	attachConsole()
+	if len(os.Args) == 1 {
+		*gui = true
+	}
 	flag.Parse()
+	if *gui {
+		if err := runGUI(); err != nil {
+			fatal(err)
+		}
+		return
+	}
 	if *showVer {
 		fmt.Println("bcvmtools", version)
 		return
@@ -44,7 +54,7 @@ func main() {
 	}
 	if password == "" {
 		fmt.Fprint(os.Stderr, "Password: ")
-		b, err := term.ReadPassword(int(syscall.Stdin))
+		b, err := term.ReadPassword(int(os.Stdin.Fd()))
 		fmt.Fprintln(os.Stderr)
 		if err != nil {
 			fatal(err)
@@ -55,35 +65,18 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 	start := time.Now()
-
-	u, err := parseServer(*server)
+	inv, sheets, host, tConn, err := CollectAll(ctx, *server, *user, password, *insecure)
 	if err != nil {
 		fatal(err)
-	}
-	u.User = url.UserPassword(*user, password)
-	c, err := govmomi.NewClient(ctx, u, *insecure)
-	if err != nil {
-		fatal(fmt.Errorf("connect: %w", err))
-	}
-	defer c.Logout(context.Background())
-	if t, ok := c.Client.Client.Transport.(*http.Transport); ok {
-		t.MaxIdleConnsPerHost = 32
-	}
-	tConn := time.Since(start)
-
-	inv, err := Collect(ctx, c.Client)
-	if err != nil {
-		fatal(fmt.Errorf("collect: %w", err))
 	}
 	tCollect := time.Since(start)
 	for _, w := range inv.Warnings {
 		fmt.Fprintln(os.Stderr, "warning:", w)
 	}
 
-	sheets := BuildSheets(inv, u.Host)
 	name := *out
 	if name == "" {
-		name = fmt.Sprintf("bcvmtools_%s_%s", strings.NewReplacer(":", "_").Replace(u.Host), time.Now().Format("20060102_150405"))
+		name = fmt.Sprintf("bcvmtools_%s_%s", strings.NewReplacer(":", "_").Replace(host), time.Now().Format("20060102_150405"))
 		if *format == "xlsx" {
 			name += ".xlsx"
 		}
@@ -102,6 +95,34 @@ func main() {
 	fmt.Printf("%d VMs, %d hosts, %d datastores -> %s (connect %s, collect %s, total %s)\n",
 		len(inv.VMs), len(inv.Hosts), len(inv.DS), name,
 		tConn.Round(time.Millisecond), (tCollect - tConn).Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
+}
+
+// CollectAll connects, gathers the full inventory and builds the sheets.
+// Shared by the CLI and the GUI.
+func CollectAll(ctx context.Context, server, user, password string, insecure bool) (inv *Inventory, sheets []*Sheet, host string, tConn time.Duration, err error) {
+	start := time.Now()
+	u, err := parseServer(server)
+	if err != nil {
+		return
+	}
+	u.User = url.UserPassword(user, password)
+	c, err := govmomi.NewClient(ctx, u, insecure)
+	if err != nil {
+		err = fmt.Errorf("connect: %w", err)
+		return
+	}
+	defer c.Logout(context.Background())
+	if t, ok := c.Client.Client.Transport.(*http.Transport); ok {
+		t.MaxIdleConnsPerHost = 32
+	}
+	tConn = time.Since(start)
+	if inv, err = Collect(ctx, c.Client); err != nil {
+		err = fmt.Errorf("collect: %w", err)
+		return
+	}
+	host = u.Host
+	sheets = BuildSheets(inv, host)
+	return
 }
 
 func parseServer(s string) (*url.URL, error) {

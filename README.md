@@ -3,6 +3,13 @@
 A fast, single-file VMware inventory exporter modelled on RVTools. Written in Go: one static
 executable, no runtime, no install. Works against vCenter or a standalone ESXi host.
 
+## GUI (Windows)
+
+Double-click `bcvmtools-windows-amd64.exe` (or run it with no arguments, or `-gui`) to open the
+window: enter vCenter/ESXi, user and password, press **Collect**, browse every tab (with a live
+filter box), then **Export Excel...** or **Export CSV folder...** once you are happy with the data.
+Run it with any CLI flag from a terminal and it behaves as the command-line tool below.
+
 ## Usage
 
 ```bash
