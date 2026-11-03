@@ -10,6 +10,7 @@ import (
 	"image/color"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -339,9 +340,17 @@ func field(parent walk.Container, caption string, width int, password bool, valu
 	return e
 }
 
+var uiLog *os.File
+
+// tracef writes a timestamped line to %AppData%\BCVMTools\ui.log (and to stderr when BCVMTOOLS_TRACE is set).
+// The log is recreated at every start and is only a few lines per action.
 func tracef(f string, a ...any) {
+	line := fmt.Sprintf("%s %s\n", time.Now().Format("15:04:05.000"), fmt.Sprintf(f, a...))
+	if uiLog != nil {
+		uiLog.WriteString(line)
+	}
 	if os.Getenv("BCVMTOOLS_TRACE") != "" {
-		fmt.Fprintf(os.Stderr, "TRACE "+f+"\n", a...)
+		fmt.Fprint(os.Stderr, "TRACE "+line)
 	}
 }
 
@@ -360,6 +369,8 @@ func runGUI() error {
 		return err
 	}
 	captureFatalCrashes(dir)
+	uiLog, _ = os.Create(filepath.Join(dir, "ui.log"))
+	tracef("started")
 	set := loadSettings()
 	var extra []Conn
 	for _, s := range set.Extra {
@@ -655,7 +666,10 @@ func runGUI() error {
 		}
 		s, m, page := models[i].sheet, models[i], pages[i]
 		t0 := time.Now()
-		tv, _ := walk.NewTableView(page)
+		tv, err := walk.NewTableView(page)
+		if err != nil {
+			panic(fmt.Errorf("cannot create the table for %s: %w", s.Name, err)) // reported in the status bar
+		}
 		tv.SetColumnsOrderable(true)
 		if uiFont != nil {
 			tv.SetFont(uiFont)
@@ -697,6 +711,7 @@ func runGUI() error {
 		if i < 0 || i >= len(models) || views[i] != nil {
 			return
 		}
+		tracef("building tab %s (%d rows)", models[i].sheet.Name, len(models[i].sheet.Rows))
 		if n := len(models[i].sheet.Rows); n > 1500 {
 			setStatus(fmt.Sprintf("Loading %s (%d rows)...", models[i].sheet.Name, n))
 		}
@@ -704,23 +719,6 @@ func runGUI() error {
 			setStatus(perr.Error())
 		}
 	}
-	const prebuildMaxRows = 1500
-	// prebuild fills in the small tabs one at a time while the user looks at the first one.
-	// Each step is a separate message-loop turn, so the window stays responsive.
-	var prebuild func(g int)
-	prebuild = func(g int) {
-		if g != generation {
-			return
-		}
-		for i := range models {
-			if views[i] == nil && len(models[i].sheet.Rows) <= prebuildMaxRows {
-				ensureBuilt(i)
-				mw.Synchronize(func() { prebuild(g) })
-				return
-			}
-		}
-	}
-
 	ensureBuiltFn = ensureBuilt
 	showSheets := func(ss []*Sheet) {
 		// walk panics if a layout pass runs while the tab control has no pages, so the new
@@ -732,6 +730,7 @@ func runGUI() error {
 			return // keep the current pages: walk panics on an empty tab control
 		}
 		generation++
+		tracef("showSheets: %d tabs", len(ss))
 		sheets, models, views, pages, cols = ss, nil, nil, nil, nil
 		for _, s := range ss {
 			page, _ := walk.NewTabPage()
@@ -754,8 +753,6 @@ func runGUI() error {
 		loading = false
 		ensureBuilt(0)
 		syncControls()
-		g := generation
-		mw.Synchronize(func() { prebuild(g) })
 	}
 
 	busy := false
@@ -1019,7 +1016,35 @@ func runGUI() error {
 			mw.Synchronize(func() { connectionsDialog(mw, &extra, true) })
 		}()
 	}
+	startUIWatchdog(mw, dir)
 	mw.Show()
 	mw.Run()
 	return nil
+}
+
+// startUIWatchdog pings the UI thread every few seconds. If it does not answer for 8 seconds the
+// window is hung: the stacks of all goroutines (which show exactly where the UI thread is stuck)
+// are appended to crash.log so a hang can be diagnosed even though nothing is visible on screen.
+func startUIWatchdog(mw *walk.MainWindow, dir string) {
+	go func() {
+		for {
+			time.Sleep(3 * time.Second)
+			ack := make(chan struct{})
+			mw.Synchronize(func() { close(ack) })
+			select {
+			case <-ack:
+				continue
+			case <-time.After(8 * time.Second):
+			}
+			tracef("WATCHDOG: UI thread not responding for 8s; dumping stacks to crash.log")
+			if f, err := os.OpenFile(filepath.Join(dir, "crash.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+				fmt.Fprintf(f, "---- UI HANG detected %s (no response for 8s)\n", time.Now().Format(time.RFC3339))
+				pprof.Lookup("goroutine").WriteTo(f, 2)
+				f.Close()
+			}
+			start := time.Now()
+			<-ack // wait until the UI recovers (or the user closes the app)
+			tracef("WATCHDOG: UI responsive again after %s", time.Since(start).Round(time.Second))
+		}
+	}()
 }
