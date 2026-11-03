@@ -44,6 +44,7 @@ var (
 	pFillRect    = user32.NewProc("FillRect")
 	pCreateBrush = gdi32.NewProc("CreateSolidBrush")
 	pPolygon     = gdi32.NewProc("Polygon")
+	pCreatePen   = gdi32.NewProc("CreatePen")
 )
 
 const (
@@ -61,12 +62,14 @@ func fillRect(hdc win.HDC, rc *win.RECT, color uintptr) {
 
 func triangle(hdc win.HDC, color uintptr, p [3]win.POINT) {
 	br, _, _ := pCreateBrush.Call(color)
+	pen, _, _ := pCreatePen.Call(0, 1, color)
 	oldB := win.SelectObject(hdc, win.HGDIOBJ(br))
-	oldP := win.SelectObject(hdc, win.GetStockObject(win.BLACK_PEN))
+	oldP := win.SelectObject(hdc, win.HGDIOBJ(pen))
 	pPolygon.Call(uintptr(hdc), uintptr(unsafe.Pointer(&p[0])), 3)
 	win.SelectObject(hdc, oldP)
 	win.SelectObject(hdc, oldB)
 	win.DeleteObject(win.HGDIOBJ(br))
+	win.DeleteObject(win.HGDIOBJ(pen))
 }
 
 // drawItem paints one heading: dark grey (amber when the column is filtered), bold text,
@@ -80,15 +83,19 @@ func (s *subclass) drawItem(cd *win.NMCUSTOMDRAW) {
 	}
 	sc := func(v int32) int32 { return v * dpi / 96 }
 	hdc, rc := cd.Hdc, cd.Rc
-	bg, fg := rgb(150, 156, 164), rgb(0, 0, 0)
+	bg, fg := rgb(58, 68, 82), rgb(255, 255, 255)
 	if filtered {
-		bg = rgb(255, 183, 77)
+		bg, fg = rgb(255, 193, 7), rgb(30, 30, 30)
 	}
 	if cd.UItemState&1 != 0 { // pressed
-		bg = bg - rgb(20, 20, 20)
+		if filtered {
+			bg = rgb(235, 173, 0)
+		} else {
+			bg = rgb(80, 92, 108)
+		}
 	}
 	fillRect(hdc, &rc, bg)
-	fillRect(hdc, &win.RECT{Left: rc.Right - 1, Top: rc.Top, Right: rc.Right, Bottom: rc.Bottom}, rgb(95, 100, 108))
+	fillRect(hdc, &win.RECT{Left: rc.Right - 1, Top: rc.Top, Right: rc.Right, Bottom: rc.Bottom}, rgb(92, 104, 120))
 
 	if s.font == 0 {
 		var lf win.LOGFONT
@@ -109,13 +116,13 @@ func (s *subclass) drawItem(cd *win.NMCUSTOMDRAW) {
 
 	cy := (rc.Top + rc.Bottom) / 2
 	ax := rc.Right - sc(12)
-	triangle(hdc, rgb(0, 0, 0), [3]win.POINT{{X: ax - sc(4), Y: cy - sc(2)}, {X: ax + sc(4), Y: cy - sc(2)}, {X: ax, Y: cy + sc(3)}})
+	triangle(hdc, fg, [3]win.POINT{{X: ax - sc(4), Y: cy - sc(2)}, {X: ax + sc(4), Y: cy - sc(2)}, {X: ax, Y: cy + sc(3)}})
 	sx := rc.Right - sc(30)
 	switch sortDir {
 	case 1:
-		triangle(hdc, rgb(0, 0, 0), [3]win.POINT{{X: sx - sc(4), Y: cy + sc(2)}, {X: sx + sc(4), Y: cy + sc(2)}, {X: sx, Y: cy - sc(3)}})
+		triangle(hdc, fg, [3]win.POINT{{X: sx - sc(4), Y: cy + sc(2)}, {X: sx + sc(4), Y: cy + sc(2)}, {X: sx, Y: cy - sc(3)}})
 	case 2:
-		triangle(hdc, rgb(0, 0, 0), [3]win.POINT{{X: sx - sc(4), Y: cy - sc(2)}, {X: sx + sc(4), Y: cy - sc(2)}, {X: sx, Y: cy + sc(3)}})
+		triangle(hdc, fg, [3]win.POINT{{X: sx - sc(4), Y: cy - sc(2)}, {X: sx + sc(4), Y: cy - sc(2)}, {X: sx, Y: cy + sc(3)}})
 	}
 }
 

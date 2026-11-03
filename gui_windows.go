@@ -4,7 +4,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,6 +16,7 @@ import (
 	"time"
 
 	"github.com/lxn/walk"
+	"github.com/lxn/win"
 )
 
 // sheetModel is a virtual, sortable, filterable table model over a Sheet.
@@ -205,79 +209,234 @@ func (m *sheetModel) Restore() {
 	m.applyFilter()
 }
 
+// ---- look & feel -----------------------------------------------------------
+
+var (
+	uiFont, uiBold *walk.Font
+	muted          = walk.RGB(96, 106, 120)
+)
+
+type settings struct {
+	Server string `json:"server"`
+	User   string `json:"user"`
+	Verify bool   `json:"verifyTLS"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+}
+
+func settingsPath() string {
+	d, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(d, "BCVMTools", "settings.json")
+}
+
+func loadSettings() (s settings) {
+	if p := settingsPath(); p != "" {
+		if b, err := os.ReadFile(p); err == nil {
+			json.Unmarshal(b, &s)
+		}
+	}
+	return
+}
+
+func saveSettings(s settings) {
+	if p := settingsPath(); p != "" {
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if b, err := json.Marshal(s); err == nil {
+			os.WriteFile(p, b, 0o644)
+		}
+	}
+}
+
+// appIcon draws a small "server stack" icon so the window has a recognisable identity.
+func appIcon() *walk.Icon {
+	const n = 64
+	img := image.NewRGBA(image.Rect(0, 0, n, n))
+	blue, white, green := color.RGBA{47, 109, 181, 255}, color.RGBA{255, 255, 255, 255}, color.RGBA{102, 205, 120, 255}
+	for y := 0; y < n; y++ {
+		for x := 0; x < n; x++ {
+			// rounded square
+			dx, dy := max(0, max(8-x, x-(n-9))), max(0, max(8-y, y-(n-9)))
+			if dx*dx+dy*dy <= 64 {
+				img.Set(x, y, blue)
+			}
+		}
+	}
+	for i := 0; i < 3; i++ {
+		y0 := 12 + i*16
+		for y := y0; y < y0+11; y++ {
+			for x := 12; x < 52; x++ {
+				img.Set(x, y, white)
+			}
+		}
+		for y := y0 + 3; y < y0+8; y++ {
+			for x := 43; x < 48; x++ {
+				img.Set(x, y, green)
+			}
+		}
+	}
+	ic, err := walk.NewIconFromImageForDPI(img, 96)
+	if err != nil {
+		return nil
+	}
+	return ic
+}
+
+func box(parent walk.Container, l walk.Layout) *walk.Composite {
+	c, _ := walk.NewComposite(parent)
+	c.SetLayout(l)
+	return c
+}
+
+func hbox(margins walk.Margins, spacing int) *walk.BoxLayout {
+	l := walk.NewHBoxLayout()
+	l.SetMargins(margins)
+	l.SetSpacing(spacing)
+	return l
+}
+
+func vbox(margins walk.Margins, spacing int) *walk.BoxLayout {
+	l := walk.NewVBoxLayout()
+	l.SetMargins(margins)
+	l.SetSpacing(spacing)
+	return l
+}
+
+func button(parent walk.Container, text, tip string, minW int) *walk.PushButton {
+	b, _ := walk.NewPushButton(parent)
+	b.SetText(text)
+	b.SetToolTipText(tip)
+	b.SetMinMaxSize(walk.Size{Width: minW, Height: 28}, walk.Size{})
+	return b
+}
+
+// field builds "caption above input", the layout recommended for compact forms.
+func field(parent walk.Container, caption string, width int, password bool, value string) *walk.LineEdit {
+	c := box(parent, vbox(walk.Margins{}, 3))
+	l, _ := walk.NewLabel(c)
+	l.SetText(caption)
+	l.SetTextColor(muted)
+	e, _ := walk.NewLineEdit(c)
+	e.SetPasswordMode(password)
+	e.SetText(value)
+	e.SetMinMaxSize(walk.Size{Width: width, Height: 24}, walk.Size{Width: width})
+	return e
+}
+
 func runGUI() error {
 	var (
 		sheets []*Sheet
 		models []*sheetModel
 	)
+	set := loadSettings()
+	if set.Width < 1000 || set.Height < 600 {
+		set.Width, set.Height = 1360, 820
+	}
+	uiFont, _ = walk.NewFont("Segoe UI", 9, 0)
+	uiBold, _ = walk.NewFont("Segoe UI", 9, walk.FontBold)
+
 	mw, err := walk.NewMainWindow()
 	if err != nil {
 		return err
 	}
-	mw.SetTitle("BCVMTools - VMware inventory")
-	mw.SetSize(walk.Size{Width: 1280, Height: 780})
-	mw.SetLayout(walk.NewVBoxLayout())
-
-	// ---- connection bar
-	bar, _ := walk.NewComposite(mw)
-	bar.SetLayout(walk.NewHBoxLayout())
-	field := func(label string, w int, pw bool, init string) *walk.LineEdit {
-		l, _ := walk.NewLabel(bar)
-		l.SetText(label)
-		e, _ := walk.NewLineEdit(bar)
-		e.SetPasswordMode(pw)
-		e.SetText(init)
-		e.SetMinMaxSize(walk.Size{Width: w}, walk.Size{Width: w})
-		return e
+	mw.SetTitle("BCVMTools - VMware Inventory")
+	if ic := appIcon(); ic != nil {
+		mw.SetIcon(ic)
 	}
-	server := field("vCenter / ESXi:", 220, false, os.Getenv("VI_SERVER"))
-	user := field("User:", 180, false, os.Getenv("VI_USER"))
-	pass := field("Password:", 140, true, os.Getenv("VI_PASSWORD"))
-	verify, _ := walk.NewCheckBox(bar)
+	if uiFont != nil {
+		mw.SetFont(uiFont)
+	}
+	mw.SetMinMaxSize(walk.Size{Width: 1000, Height: 600}, walk.Size{})
+	mw.SetLayout(vbox(walk.Margins{HNear: 12, VNear: 10, HFar: 12, VFar: 6}, 10))
+
+	// ---- connection
+	gb, _ := walk.NewGroupBox(mw)
+	gb.SetTitle("Connection")
+	gb.SetLayout(hbox(walk.Margins{HNear: 10, VNear: 8, HFar: 10, VFar: 10}, 14))
+	server := field(gb, "vCenter or ESXi host", 280, false, firstNonEmpty(set.Server, os.Getenv("VI_SERVER")))
+	user := field(gb, "User name", 220, false, firstNonEmpty(set.User, os.Getenv("VI_USER")))
+	pass := field(gb, "Password", 190, true, os.Getenv("VI_PASSWORD"))
+	opts := box(gb, vbox(walk.Margins{}, 3))
+	sp, _ := walk.NewLabel(opts)
+	sp.SetText(" ")
+	verify, _ := walk.NewCheckBox(opts)
 	verify.SetText("Verify TLS certificate")
-	collectBtn, _ := walk.NewPushButton(bar)
-	collectBtn.SetText("Collect")
+	verify.SetChecked(set.Verify)
+	verify.SetToolTipText("Leave unticked for self-signed certificates (the usual vCenter default)")
+	btnBox := box(gb, vbox(walk.Margins{}, 3))
+	sp2, _ := walk.NewLabel(btnBox)
+	sp2.SetText(" ")
+	collectBtn := button(btnBox, "Collect", "Connect and gather the inventory (Enter / F5)", 120)
+	if uiBold != nil {
+		collectBtn.SetFont(uiBold)
+	}
+	walk.NewHSpacer(gb)
+
+	progress, _ := walk.NewProgressBar(mw)
+	progress.SetMarqueeMode(true)
+	progress.SetVisible(false)
+	progress.SetMinMaxSize(walk.Size{Height: 6}, walk.Size{Height: 6})
+
+	// ---- command bar
+	bar := box(mw, hbox(walk.Margins{}, 6))
+	filter, _ := walk.NewLineEdit(bar)
+	filter.SetCueBanner("Search all columns  (Ctrl+F)")
+	filter.SetMinMaxSize(walk.Size{Width: 280, Height: 26}, walk.Size{Width: 280})
+	colFilterBtn := button(bar, "Filter column...", "Pick a column to filter. Also: right-click a heading, or use its arrow", 110)
+	clearBtn := button(bar, "Clear filters", "Remove every filter on this tab", 90)
+	walk.NewVSeparator(bar)
+	removeBtn := button(bar, "Remove selected rows", "Delete the selected rows from the data (Ctrl/Shift-click to select several)", 140)
+	keepBtn := button(bar, "Keep only filtered rows", "Permanently drop every row hidden by the current filters", 150)
+	restoreBtn := button(bar, "Restore all rows", "Bring back the original rows of this tab", 110)
 	walk.NewHSpacer(bar)
-
-	// ---- filter bar
-	bar2, _ := walk.NewComposite(mw)
-	bar2.SetLayout(walk.NewHBoxLayout())
-	fl, _ := walk.NewLabel(bar2)
-	fl.SetText("Search all columns:")
-	filter, _ := walk.NewLineEdit(bar2)
-	filter.SetMinMaxSize(walk.Size{Width: 240}, walk.Size{Width: 240})
-	clearBtn, _ := walk.NewPushButton(bar2)
-	clearBtn.SetText("Clear all filters")
-	colFilterBtn, _ := walk.NewPushButton(bar2)
-	colFilterBtn.SetText("Filter column...")
-	removeBtn, _ := walk.NewPushButton(bar2)
-	removeBtn.SetText("Remove selected rows")
-	keepBtn, _ := walk.NewPushButton(bar2)
-	keepBtn.SetText("Keep only filtered rows")
-	restoreBtn, _ := walk.NewPushButton(bar2)
-	restoreBtn.SetText("Restore all rows")
-	walk.NewHSpacer(bar2)
-
-	// ---- export bar
-	bar3, _ := walk.NewComposite(mw)
-	bar3.SetLayout(walk.NewHBoxLayout())
-	xlsxBtn, _ := walk.NewPushButton(bar3)
-	xlsxBtn.SetText("Export Excel...")
-	csvBtn, _ := walk.NewPushButton(bar3)
-	csvBtn.SetText("Export CSV folder...")
-	walk.NewHSpacer(bar3)
-	for _, b := range []*walk.PushButton{xlsxBtn, csvBtn, clearBtn, colFilterBtn, removeBtn, keepBtn, restoreBtn} {
+	xlsxBtn := button(bar, "Export Excel...", "Save every tab to one .xlsx workbook (Ctrl+S)", 110)
+	csvBtn := button(bar, "Export CSV...", "Save one .csv file per tab into a folder", 100)
+	allBtns := []*walk.PushButton{xlsxBtn, csvBtn, clearBtn, colFilterBtn, removeBtn, keepBtn, restoreBtn}
+	for _, b := range allBtns {
 		b.SetEnabled(false)
 	}
+	filter.SetEnabled(false)
 
+	// ---- tabs (bold names) with a welcome page until data arrives
 	tabs, _ := walk.NewTabWidget(mw)
-	boldFont, _ := walk.NewFont("Segoe UI", 9, walk.FontBold)
-	regularFont, _ := walk.NewFont("Segoe UI", 9, 0)
-	if boldFont != nil {
-		tabs.SetFont(boldFont) // bold tab names; tables below get the regular font explicitly
+	if uiBold != nil {
+		tabs.SetFont(uiBold)
 	}
-	status, _ := walk.NewLabel(mw)
-	status.SetText("Enter connection details and press Collect.")
+
+	// ---- status bar
+	sb := mw.StatusBar()
+	msgItem := walk.NewStatusBarItem()
+	msgItem.SetWidth(700)
+	cntItem := walk.NewStatusBarItem()
+	cntItem.SetWidth(320)
+	sb.Items().Add(msgItem)
+	sb.Items().Add(cntItem)
+	sb.SetVisible(true)
+	setStatus := func(s string) { msgItem.SetText(s) }
+	setStatus("Ready")
+
+	showWelcome := func() {
+		tabs.Pages().Clear()
+		page, _ := walk.NewTabPage()
+		page.SetTitle("Getting started")
+		page.SetLayout(vbox(walk.Margins{HNear: 20, VNear: 20, HFar: 20, VFar: 20}, 8))
+		walk.NewVSpacer(page)
+		t, _ := walk.NewLabel(page)
+		t.SetTextAlignment(walk.AlignCenter)
+		t.SetText("No inventory loaded yet")
+		if f, _ := walk.NewFont("Segoe UI", 16, walk.FontBold); f != nil {
+			t.SetFont(f)
+		}
+		d, _ := walk.NewLabel(page)
+		d.SetTextAlignment(walk.AlignCenter)
+		d.SetTextColor(muted)
+		d.SetText("Enter your vCenter or ESXi details above and press Collect.\nYou can then sort, filter and tidy every tab before exporting to Excel or CSV.")
+		walk.NewVSpacer(page)
+		tabs.Pages().Add(page)
+	}
+	showWelcome()
 
 	var (
 		views   []*walk.TableView
@@ -300,8 +459,15 @@ func runGUI() error {
 	refreshCounts := func(i int) {
 		m := models[i]
 		pages[i].SetTitle(fmt.Sprintf("%s (%d)", m.sheet.Name, len(m.sheet.Rows)))
-		status.SetText(fmt.Sprintf("%s: showing %d of %d rows (original %d). Click a heading to sort. To filter: right-click a heading, use its arrow, or press 'Filter column...'.",
-			m.sheet.Name, len(m.view), len(m.sheet.Rows), len(m.orig)))
+		cntItem.SetText(fmt.Sprintf("%s: %d of %d rows shown", m.sheet.Name, len(m.view), len(m.sheet.Rows)))
+		switch {
+		case m.Filtered():
+			setStatus("Filters active on this tab. Amber headings show filtered columns.")
+		case len(m.sheet.Rows) != len(m.orig):
+			setStatus(fmt.Sprintf("%d rows removed from this tab. 'Restore all rows' brings them back.", len(m.orig)-len(m.sheet.Rows)))
+		default:
+			setStatus("Click a heading to sort. Right-click a heading, or use 'Filter column...', to filter.")
+		}
 	}
 	syncControls := func() {
 		i := curIdx()
@@ -331,7 +497,7 @@ func runGUI() error {
 		}
 	})
 	openColumnFilter := func(i, col int) {
-		if col < 0 || col >= len(models[i].sheet.Header) {
+		if i >= len(models) || col < 0 || col >= len(models[i].sheet.Header) {
 			return
 		}
 		if columnFilterDialog(mw, models[i], col) {
@@ -378,7 +544,7 @@ func runGUI() error {
 		if i := curIdx(); i >= 0 {
 			sel := views[i].SelectedIndexes()
 			if len(sel) == 0 {
-				walk.MsgBox(mw, "BCVMTools", "Select one or more rows first (Ctrl/Shift-click for several).", walk.MsgBoxIconInformation)
+				walk.MsgBox(mw, "Remove rows", "Select one or more rows first (Ctrl/Shift-click for several).", walk.MsgBoxIconInformation)
 				return
 			}
 			models[i].RemoveRows(sel)
@@ -389,7 +555,7 @@ func runGUI() error {
 	keepBtn.Clicked().Attach(func() {
 		if i := curIdx(); i >= 0 {
 			if !models[i].Filtered() {
-				walk.MsgBox(mw, "BCVMTools", "Apply a filter first (search box or a heading arrow); rows that do not match will be removed.", walk.MsgBoxIconInformation)
+				walk.MsgBox(mw, "Keep filtered rows", "Apply a filter first (search box or a column filter). Rows that do not match will be removed.", walk.MsgBoxIconInformation)
 				return
 			}
 			models[i].KeepFiltered()
@@ -409,11 +575,11 @@ func runGUI() error {
 		for _, s := range ss {
 			page, _ := walk.NewTabPage()
 			page.SetTitle(fmt.Sprintf("%s (%d)", s.Name, len(s.Rows)))
-			page.SetLayout(walk.NewVBoxLayout())
+			page.SetLayout(vbox(walk.Margins{HNear: 4, VNear: 4, HFar: 4, VFar: 4}, 0))
 			tv, _ := walk.NewTableView(page)
 			tv.SetColumnsOrderable(true)
-			if regularFont != nil {
-				tv.SetFont(regularFont)
+			if uiFont != nil {
+				tv.SetFont(uiFont)
 			}
 			tv.SetMultiSelection(true)
 			var tcols []*walk.TableViewColumn
@@ -450,49 +616,71 @@ func runGUI() error {
 			tv.SetModel(m)
 			tabs.Pages().Add(page)
 		}
-		for _, b := range []*walk.PushButton{xlsxBtn, csvBtn, clearBtn, colFilterBtn, removeBtn, keepBtn, restoreBtn} {
+		for _, b := range allBtns {
 			b.SetEnabled(len(ss) > 0)
 		}
+		filter.SetEnabled(len(ss) > 0)
 		syncControls()
 	}
 
-	collectBtn.Clicked().Attach(func() {
-		if server.Text() == "" || user.Text() == "" {
-			walk.MsgBox(mw, "BCVMTools", "Server and user are required.", walk.MsgBoxIconWarning)
+	busy := false
+	doCollect := func() {
+		if busy {
 			return
 		}
-		srv, usr, pw, ins := server.Text(), user.Text(), pass.Text(), !verify.Checked()
+		if strings.TrimSpace(server.Text()) == "" || strings.TrimSpace(user.Text()) == "" {
+			walk.MsgBox(mw, "Connection", "Please enter the server and user name.", walk.MsgBoxIconWarning)
+			return
+		}
+		srv, usr, pw, ins := strings.TrimSpace(server.Text()), strings.TrimSpace(user.Text()), pass.Text(), !verify.Checked()
+		busy = true
 		collectBtn.SetEnabled(false)
-		status.SetText("Connecting and collecting...")
+		gb.SetEnabled(false)
+		progress.SetVisible(true)
+		setStatus("Connecting to " + srv + " and collecting...")
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 			defer cancel()
 			t0 := time.Now()
 			inv, ss, _, _, err := CollectAll(ctx, srv, usr, pw, ins)
 			mw.Synchronize(func() {
+				busy = false
 				collectBtn.SetEnabled(true)
+				gb.SetEnabled(true)
+				progress.SetVisible(false)
 				if err != nil {
-					status.SetText("Failed: " + err.Error())
-					walk.MsgBox(mw, "BCVMTools", err.Error(), walk.MsgBoxIconError)
+					setStatus("Failed: " + err.Error())
+					walk.MsgBox(mw, "Collection failed", err.Error(), walk.MsgBoxIconError)
 					return
 				}
 				showSheets(ss)
-				msg := fmt.Sprintf("%d VMs, %d hosts, %d datastores collected in %s. Review the tabs, then export.",
+				msg := fmt.Sprintf("Collected %d VMs, %d hosts, %d datastores in %s. Review the tabs, then export.",
 					len(inv.VMs), len(inv.Hosts), len(inv.DS), time.Since(t0).Round(time.Millisecond))
 				if len(inv.Warnings) > 0 {
 					msg += fmt.Sprintf(" (%d warnings: %s)", len(inv.Warnings), inv.Warnings[0])
 				}
-				status.SetText(msg)
+				setStatus(msg)
+				if i := curIdx(); i >= 0 {
+					cntItem.SetText(fmt.Sprintf("%s: %d of %d rows shown", models[i].sheet.Name, len(models[i].view), len(models[i].sheet.Rows)))
+				}
 			})
 		}()
+	}
+	collectBtn.Clicked().Attach(doCollect)
+	pass.KeyDown().Attach(func(k walk.Key) {
+		if k == walk.KeyReturn {
+			doCollect()
+		}
 	})
 
-	stamp := time.Now().Format("20060102_150405")
-	xlsxBtn.Clicked().Attach(func() {
+	exportXLSX := func() {
+		if len(sheets) == 0 {
+			return
+		}
 		dlg := new(walk.FileDialog)
 		dlg.Title = "Export to Excel"
 		dlg.Filter = "Excel workbook (*.xlsx)|*.xlsx"
-		dlg.FilePath = "bcvmtools_" + stamp + ".xlsx"
+		dlg.FilePath = "bcvmtools_" + time.Now().Format("20060102_150405") + ".xlsx"
 		if ok, _ := dlg.ShowSave(mw); !ok {
 			return
 		}
@@ -501,14 +689,15 @@ func runGUI() error {
 			p += ".xlsx"
 		}
 		if err := WriteXLSX(p, sheets); err != nil {
-			walk.MsgBox(mw, "BCVMTools", err.Error(), walk.MsgBoxIconError)
+			walk.MsgBox(mw, "Export failed", err.Error(), walk.MsgBoxIconError)
 			return
 		}
-		status.SetText("Exported " + p)
-	})
+		setStatus("Exported " + p)
+	}
+	xlsxBtn.Clicked().Attach(exportXLSX)
 	csvBtn.Clicked().Attach(func() {
 		dlg := new(walk.FileDialog)
-		dlg.Title = "Choose a folder for the CSV files"
+		dlg.Title = "Choose a folder for the CSV files (one file per tab)"
 		dlg.Filter = "CSV files (*.csv)|*.csv"
 		dlg.FilePath = "inventory.csv"
 		if ok, _ := dlg.ShowSave(mw); !ok {
@@ -516,13 +705,51 @@ func runGUI() error {
 		}
 		dir := filepath.Dir(dlg.FilePath)
 		if err := WriteCSV(dir, sheets); err != nil {
-			walk.MsgBox(mw, "BCVMTools", err.Error(), walk.MsgBoxIconError)
+			walk.MsgBox(mw, "Export failed", err.Error(), walk.MsgBoxIconError)
 			return
 		}
-		status.SetText("Exported CSV files to " + dir)
+		setStatus("Exported CSV files to " + dir)
 	})
+
+	// ---- keyboard shortcuts
+	addKey := func(mod walk.Modifiers, key walk.Key, fn func()) {
+		a := walk.NewAction()
+		a.SetShortcut(walk.Shortcut{Modifiers: mod, Key: key})
+		a.Triggered().Attach(fn)
+		mw.ShortcutActions().Add(a)
+	}
+	addKey(walk.ModControl, walk.KeyF, func() {
+		if filter.Enabled() {
+			filter.SetFocus()
+		}
+	})
+	addKey(walk.ModControl, walk.KeyS, exportXLSX)
+	addKey(0, walk.KeyF5, doCollect)
+
+	// ---- window placement / persistence
+	sw, sh := int(win.GetSystemMetrics(win.SM_CXSCREEN)), int(win.GetSystemMetrics(win.SM_CYSCREEN))
+	w, h := min(set.Width, sw-40), min(set.Height, sh-80)
+	mw.SetBoundsPixels(walk.Rectangle{X: (sw - w) / 2, Y: (sh-h)/2 - 20, Width: w, Height: h})
+	mw.Closing().Attach(func(*bool, walk.CloseReason) {
+		b := mw.BoundsPixels()
+		saveSettings(settings{Server: strings.TrimSpace(server.Text()), User: strings.TrimSpace(user.Text()), Verify: verify.Checked(), Width: b.Width, Height: b.Height})
+	})
+	if strings.TrimSpace(server.Text()) == "" {
+		server.SetFocus()
+	} else {
+		pass.SetFocus()
+	}
 
 	mw.Show()
 	mw.Run()
 	return nil
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }

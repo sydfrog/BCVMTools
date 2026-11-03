@@ -80,11 +80,14 @@ func columnFilterDialog(owner walk.Form, m *sheetModel, col int) bool {
 		return false
 	}
 	dlg.SetTitle("Filter: " + m.sheet.Header[col])
-	dlg.SetLayout(walk.NewVBoxLayout())
-	dlg.SetMinMaxSize(walk.Size{Width: 360, Height: 520}, walk.Size{})
+	if uiFont != nil {
+		dlg.SetFont(uiFont)
+	}
+	dlg.SetLayout(vbox(walk.Margins{HNear: 12, VNear: 12, HFar: 12, VFar: 12}, 8))
+	dlg.SetMinMaxSize(walk.Size{Width: 380, Height: 540}, walk.Size{})
 
 	sortBar, _ := walk.NewComposite(dlg)
-	sortBar.SetLayout(walk.NewHBoxLayout())
+	sortBar.SetLayout(hbox(walk.Margins{}, 6))
 	asc, _ := walk.NewPushButton(sortBar)
 	asc.SetText("Sort A to Z")
 	desc, _ := walk.NewPushButton(sortBar)
@@ -94,6 +97,7 @@ func columnFilterDialog(owner walk.Form, m *sheetModel, col int) bool {
 
 	search, _ := walk.NewLineEdit(dlg)
 	search.SetCueBanner("Search values")
+	search.SetMinMaxSize(walk.Size{Height: 26}, walk.Size{})
 	selAll, _ := walk.NewCheckBox(dlg)
 	selAll.SetText("(Select all shown)")
 	selAll.SetChecked(true)
@@ -125,14 +129,16 @@ func columnFilterDialog(owner walk.Form, m *sheetModel, col int) bool {
 	})
 
 	btns, _ := walk.NewComposite(dlg)
-	btns.SetLayout(walk.NewHBoxLayout())
+	btns.SetLayout(hbox(walk.Margins{}, 6))
 	clear, _ := walk.NewPushButton(btns)
 	clear.SetText("Clear filter")
 	walk.NewHSpacer(btns)
 	ok, _ := walk.NewPushButton(btns)
 	ok.SetText("OK")
+	ok.SetMinMaxSize(walk.Size{Width: 84, Height: 28}, walk.Size{})
 	cancel, _ := walk.NewPushButton(btns)
 	cancel.SetText("Cancel")
+	cancel.SetMinMaxSize(walk.Size{Width: 84, Height: 28}, walk.Size{})
 	dlg.SetDefaultButton(ok)
 	dlg.SetCancelButton(cancel)
 	cancel.Clicked().Attach(func() { dlg.Cancel() })

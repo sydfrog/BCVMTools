@@ -8,7 +8,12 @@ executable, no runtime, no install. Works against vCenter or a standalone ESXi h
 Double-click `bcvmtools-windows-amd64.exe` (or run it with no arguments, or `-gui`) to open the
 window: enter vCenter/ESXi, user and password, press **Collect**, browse every tab (with a live
 filter box), then **Export Excel...** or **Export CSV folder...** once you are happy with the data.
-Run it with any CLI flag from a terminal and it behaves as the command-line tool below.
+Handy: **Enter** in the password box or **F5** collects, **Ctrl+F** jumps to search, **Ctrl+S** exports to
+Excel. Server, user name, TLS choice and window size are remembered (never the password) in
+`%AppData%\BCVMTools\settings.json`.
+
+Sort by clicking a heading. Filter by right-clicking a heading, using its arrow, or the **Filter column...**
+button; filtered columns turn amber. Run it with any CLI flag from a terminal and it behaves as the command-line tool below.
 
 ## Usage
 
