@@ -572,7 +572,7 @@ var _ = mo.VirtualMachine{}
 // object becomes a warning instead of taking down the whole run.
 func (inv *Inventory) guard(kind, name string) {
 	if r := recover(); r != nil {
-		inv.Warnings = append(inv.Warnings, fmt.Sprintf("%s %q skipped (internal error: %v)", kind, name, r))
+		inv.addWarning(fmt.Sprintf("%s %q skipped (internal error: %v)", kind, name, r))
 		writeCrashLog(fmt.Sprintf("%s %q: %v", kind, name, r))
 	}
 }

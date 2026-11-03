@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lxn/walk"
@@ -217,12 +218,13 @@ var (
 )
 
 type settings struct {
-	Server string      `json:"server"`
-	User   string      `json:"user"`
-	Verify bool        `json:"verifyTLS"`
-	Width  int         `json:"width"`
-	Height int         `json:"height"`
-	Extra  []savedConn `json:"extra,omitempty"` // additional vCenters (never passwords)
+	Server     string      `json:"server"`
+	User       string      `json:"user"`
+	Verify     bool        `json:"verifyTLS"`
+	TimeoutMin int         `json:"timeoutMinutes,omitempty"`
+	Width      int         `json:"width"`
+	Height     int         `json:"height"`
+	Extra      []savedConn `json:"extra,omitempty"` // additional vCenters (never passwords)
 }
 
 type savedConn struct {
@@ -391,6 +393,19 @@ func runGUI() error {
 	verify.SetText("Verify TLS certificate")
 	verify.SetChecked(set.Verify)
 	verify.SetToolTipText("Leave unticked for self-signed certificates (the usual vCenter default)")
+	tb := box(gb, vbox(walk.Margins{}, 3))
+	tl, _ := walk.NewLabel(tb)
+	tl.SetText("Timeout per vCenter (min)")
+	tl.SetTextColor(muted)
+	timeEdit, _ := walk.NewNumberEdit(tb)
+	timeEdit.SetDecimals(0)
+	timeEdit.SetRange(1, 240)
+	timeEdit.SetValue(float64(max(set.TimeoutMin, 0)))
+	if set.TimeoutMin <= 0 {
+		timeEdit.SetValue(10)
+	}
+	timeEdit.SetMinMaxSize(walk.Size{Width: 90, Height: 24}, walk.Size{Width: 90})
+	timeEdit.SetToolTipText("How long each vCenter may take to log in and be collected before it is reported as timed out. Raise this for slow vCenters.")
 	btnBox := box(gb, vbox(walk.Margins{}, 3))
 	sp2, _ := walk.NewLabel(btnBox)
 	sp2.SetText(" ")
@@ -671,10 +686,16 @@ func runGUI() error {
 	}
 
 	busy := false
+	var cancelRun context.CancelFunc
+	inputs := []walk.Window{server, user, pass, verify, moreBtn, timeEdit}
 	endBusy := func() {
 		busy = false
-		collectBtn.SetEnabled(true)
-		gb.SetEnabled(true)
+		cancelRun = nil
+		for _, w := range inputs {
+			w.SetEnabled(true)
+		}
+		collectBtn.SetText("Collect")
+		collectBtn.SetToolTipText("Connect and gather the inventory (Enter / F5)")
 		progress.SetVisible(false)
 	}
 	finish := func(ss []*Sheet, results []ConnResult, t0 time.Time) {
@@ -710,7 +731,7 @@ func runGUI() error {
 	}
 	savePrefs := func() {
 		b := mw.BoundsPixels()
-		s := settings{Server: strings.TrimSpace(server.Text()), User: strings.TrimSpace(user.Text()), Verify: verify.Checked(), Width: b.Width, Height: b.Height}
+		s := settings{Server: strings.TrimSpace(server.Text()), User: strings.TrimSpace(user.Text()), Verify: verify.Checked(), TimeoutMin: int(timeEdit.Value()), Width: b.Width, Height: b.Height}
 		for _, c := range extra {
 			s.Extra = append(s.Extra, savedConn{Server: c.Server, User: c.User, Source: c.Source})
 		}
@@ -757,21 +778,55 @@ func runGUI() error {
 		}
 		savePrefs()
 		busy = true
-		collectBtn.SetEnabled(false)
-		gb.SetEnabled(false)
+		for _, w := range inputs {
+			w.SetEnabled(false)
+		}
+		collectBtn.SetText("Cancel")
+		collectBtn.SetToolTipText("Stop collecting. vCenters that already finished are kept.")
 		progress.SetVisible(true)
 		if len(targets) == 1 {
 			setStatus("Connecting to " + vcLabel(targets[0].Server) + " and collecting...")
 		} else {
 			setStatus(fmt.Sprintf("Connecting to %d vCenters and collecting in parallel...", len(targets)))
 		}
+		budget := time.Duration(timeEdit.Value()) * time.Minute
+		ctx, cancel := context.WithCancel(context.Background())
+		cancelRun = cancel
+		states := map[string]string{}
+		var smu sync.Mutex
+		report := func(label, state string) { // called from worker goroutines
+			smu.Lock()
+			states[label] = state
+			var done, failed int
+			var busyOnes []string
+			for l, s := range states {
+				switch s {
+				case "done":
+					done++
+				case "failed":
+					failed++
+				default:
+					busyOnes = append(busyOnes, l+": "+s)
+				}
+			}
+			smu.Unlock()
+			sort.Strings(busyOnes)
+			if len(busyOnes) > 3 {
+				busyOnes = append(busyOnes[:3], fmt.Sprintf("+%d more", len(busyOnes)-3))
+			}
+			msg := fmt.Sprintf("Collecting from %d vCenter(s): %d done, %d failed. Working: %s", len(targets), done, failed, strings.Join(busyOnes, ", "))
+			mw.Synchronize(func() {
+				if busy {
+					setStatus(msg)
+				}
+			})
+		}
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
 			t0 := time.Now()
 			var ss []*Sheet
 			var results []ConnResult
-			perr := safely(func() { ss, results = CollectMany(ctx, targets) }) // each vCenter also recovers on its own
+			perr := safely(func() { ss, results = CollectMany(ctx, targets, Options{Timeout: budget, Progress: report}) }) // each vCenter also recovers on its own
 			mw.Synchronize(func() {
 				// showing the results must not be able to kill the app either
 				if perr == nil {
@@ -785,7 +840,17 @@ func runGUI() error {
 			})
 		}()
 	}
-	collectBtn.Clicked().Attach(doCollect)
+	collectBtn.Clicked().Attach(func() {
+		if busy {
+			if cancelRun != nil {
+				cancelRun()
+				setStatus("Cancelling...")
+				collectBtn.SetEnabled(false) // re-enabled when the run ends
+			}
+			return
+		}
+		doCollect()
+	})
 	pass.KeyDown().Attach(func(k walk.Key) {
 		if k == walk.KeyReturn {
 			doCollect()

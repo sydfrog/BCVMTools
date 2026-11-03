@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/vmware/govmomi/simulator"
+	"github.com/vmware/govmomi/vim25/mo"
+	"github.com/vmware/govmomi/vim25/types"
 )
 
 // Regression: a failing vCenter must be reported (the GUI once crashed when an error was
@@ -17,7 +20,7 @@ import (
 func TestCollectManyReportsErrors(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	sheets, res := CollectMany(ctx, []Target{{Server: "127.0.0.1:1", User: "u", Password: "p", Insecure: true}})
+	sheets, res := CollectMany(ctx, []Target{{Server: "127.0.0.1:1", User: "u", Password: "p", Insecure: true}}, Options{})
 	if len(res) != 1 || res[0].OK || res[0].Error == "" {
 		t.Fatalf("expected a failed result with an error, got %+v", res)
 	}
@@ -47,7 +50,7 @@ func TestCollectManyMergesAndTags(t *testing.T) {
 		{Server: a, User: "u", Password: "p", Source: "Manual", Insecure: true},
 		{Server: b, User: "u", Password: "p", Source: "VCF: x / d1", Insecure: true},
 		{Server: "127.0.0.1:1", User: "u", Password: "p", Insecure: true},
-	})
+	}, Options{})
 	if !res[0].OK || !res[1].OK || res[2].OK {
 		t.Fatalf("results: %+v", res)
 	}
@@ -133,5 +136,75 @@ func TestDiscoverVCFOps(t *testing.T) {
 	}
 	if _, err := DiscoverVCFOps(context.Background(), srv.URL, "admin", "bad", "vIDB", true); err == nil {
 		t.Fatal("expected login failure")
+	}
+}
+
+// A vCenter that accepts the connection but never answers must not hang the collection:
+// it is reported as timed out while the healthy vCenter still succeeds.
+func TestCollectManyHungVCenter(t *testing.T) {
+	good := simVC(t)
+	hung := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select { // never respond (but let go eventually so the test server can shut down)
+		case <-r.Context().Done():
+		case <-time.After(6 * time.Second):
+		}
+	}))
+	defer hung.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	t0 := time.Now()
+	sheets, res := CollectMany(ctx, []Target{
+		{Server: hung.Listener.Addr().String(), User: "u", Password: "p", Insecure: true},
+		{Server: good, User: "u", Password: "p", Insecure: true},
+	}, Options{Timeout: 3 * time.Second})
+	if time.Since(t0) > 30*time.Second {
+		t.Fatalf("took too long: %s", time.Since(t0))
+	}
+	if res[0].OK || !strings.Contains(res[0].Error, "Timed out") {
+		t.Fatalf("hung vCenter result: %+v", res[0])
+	}
+	if !res[1].OK {
+		t.Fatalf("healthy vCenter should succeed: %+v", res[1])
+	}
+	if res[0].Network == "" {
+		t.Error("expected a network check summary")
+	}
+	t.Logf("hung: %q | net: %s | %d sheets in %s", res[0].Error, res[0].Network, len(sheets), time.Since(t0).Round(time.Millisecond))
+}
+
+// Cancelling stops everything promptly.
+func TestCollectManyCancel(t *testing.T) {
+	hung := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(6 * time.Second):
+		}
+	}))
+	defer hung.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(500 * time.Millisecond); cancel() }()
+	t0 := time.Now()
+	_, res := CollectMany(ctx, []Target{{Server: hung.Listener.Addr().String(), User: "u", Password: "p", Insecure: true}}, Options{Timeout: time.Minute})
+	if time.Since(t0) > 10*time.Second || res[0].OK || res[0].Error != "Cancelled." {
+		t.Fatalf("cancel result after %s: %+v", time.Since(t0), res[0])
+	}
+}
+
+// One unreadable VM (permission fault) must not fail the whole retrieval.
+func TestSanitizeMissingSet(t *testing.T) {
+	inv := &Inventory{}
+	raw := []types.ObjectContent{
+		{Obj: types.ManagedObjectReference{Type: "VirtualMachine", Value: "vm-1"},
+			PropSet: []types.DynamicProperty{{Name: "name", Val: "good"}}},
+		{Obj: types.ManagedObjectReference{Type: "VirtualMachine", Value: "vm-2"},
+			PropSet:    []types.DynamicProperty{{Name: "name", Val: "locked"}},
+			MissingSet: []types.MissingProperty{{Path: "config", Fault: types.LocalizedMethodFault{Fault: &types.NoPermission{}, LocalizedMessage: "Permission to perform this operation was denied."}}}},
+	}
+	var vms []mo.VirtualMachine
+	if err := mo.LoadObjectContent(inv.sanitize(raw, "VM"), &vms); err != nil {
+		t.Fatal(err)
+	}
+	if len(vms) != 2 || len(inv.Warnings) != 1 || !strings.Contains(inv.Warnings[0], "locked") {
+		t.Fatalf("vms=%d warnings=%v", len(vms), inv.Warnings)
 	}
 }

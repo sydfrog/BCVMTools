@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/vmware/govmomi"
+	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/govmomi/vim25/types"
 )
 
@@ -32,7 +35,9 @@ type ConnResult struct {
 	Source   string
 	User     string
 	OK       bool
-	Error    string
+	Error    string // short, actionable message
+	Details  string // technical error text
+	Network  string // DNS/TCP/TLS timings when the connection failed
 	About    types.AboutInfo
 	VMs      int
 	Hosts    int
@@ -43,6 +48,22 @@ type ConnResult struct {
 }
 
 const maxParallelVCenters = 4
+
+// Options tunes a multi-vCenter collection.
+type Options struct {
+	Timeout  time.Duration             // budget for each vCenter (connect + collect); default 10 min
+	Progress func(label, state string) // optional; called from worker goroutines
+}
+
+func (o Options) timeout() time.Duration {
+	if o.Timeout <= 0 {
+		return 10 * time.Minute
+	}
+	return o.Timeout
+}
+
+// loginTimeout bounds connecting and logging in: a loaded vCenter can take a minute or more.
+const loginTimeout = 2 * time.Minute
 
 // vcLabel is the name that identifies a vCenter in the "vCenter" column.
 func vcLabel(server string) string {
@@ -56,65 +77,235 @@ func vcLabel(server string) string {
 	return u.Host
 }
 
+func isTransient(err error) bool {
+	s := strings.ToLower(err.Error())
+	for _, k := range []string{"timeout", "deadline exceeded", "eof", "connection reset", "broken pipe", "502", "503", "504", "temporarily"} {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
+}
+
 // collectOne connects to a single vCenter and builds its sheets (each row tagged with the vCenter).
-func collectOne(ctx context.Context, t Target) (inv *Inventory, sheets []*Sheet, err error) {
+// ctx carries the per-vCenter deadline and the user's Cancel.
+func collectOne(ctx context.Context, t Target, o Options) (*Inventory, []*Sheet, error) {
+	label := vcLabel(t.Server)
+	note := func(s string) {
+		if o.Progress != nil {
+			o.Progress(label, s)
+		}
+	}
 	u, err := parseServer(t.Server)
 	if err != nil {
 		return nil, nil, err
 	}
 	u.User = url.UserPassword(t.User, t.Password)
-	c, err := govmomi.NewClient(ctx, u, t.Insecure)
+
+	note("connecting")
+	lctx, lcancel := context.WithTimeout(ctx, loginTimeout)
+	c, err := govmomi.NewClient(lctx, u, t.Insecure)
+	lcancel()
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect: %w", err)
 	}
-	defer c.Logout(context.Background())
+	defer func() {
+		lctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // never hang on logout
+		defer cancel()
+		c.Logout(lctx)
+	}()
 	if tr, ok := c.Client.Client.Transport.(*http.Transport); ok {
 		tr.MaxIdleConnsPerHost = 32
 	}
-	if inv, err = Collect(ctx, c.Client); err != nil {
+
+	note("collecting")
+	inv, err := CollectTuned(ctx, c.Client, defaultTuning)
+	if err != nil && ctx.Err() == nil && isTransient(err) {
+		note("retrying gently (slow vCenter)")
+		inv, err = CollectTuned(ctx, c.Client, gentleTuning)
+	}
+	if err != nil {
 		return nil, nil, fmt.Errorf("collect: %w", err)
 	}
-	return inv, BuildSheets(inv, vcLabel(t.Server)), nil
+	note("building tables")
+	return inv, BuildSheets(inv, label), nil
 }
 
 // CollectMany collects from every target in parallel and merges the results into one set of
-// sheets in which every row carries its vCenter. A failing vCenter does not stop the others;
-// it is reported on the vCenters tab. The first sheet returned is that vCenters tab.
-func CollectMany(ctx context.Context, targets []Target) ([]*Sheet, []ConnResult) {
+// sheets in which every row carries its vCenter. A failing or slow vCenter does not stop the
+// others: each has its own deadline, is reported on the vCenters tab, and cancelling ctx stops
+// everything promptly. The first sheet returned is the vCenters tab.
+func CollectMany(ctx context.Context, targets []Target, opts Options) ([]*Sheet, []ConnResult) {
 	results := make([]ConnResult, len(targets))
 	per := make([][]*Sheet, len(targets))
+	finished := make([]bool, len(targets))
+	var mu sync.Mutex
 	sem := make(chan struct{}, maxParallelVCenters)
 	var wg sync.WaitGroup
+	budget := opts.timeout()
+
 	for i, t := range targets {
 		i, t := i, t
 		results[i] = ConnResult{Label: vcLabel(t.Server), Source: t.Source, User: t.User}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				mu.Lock()
+				results[i].Error, results[i].Details, finished[i] = "Cancelled before it started.", "", true
+				mu.Unlock()
+				return
+			}
+			defer func() { // a bug while describing a failure must not take the application down
+				if r := recover(); r != nil {
+					writeCrashLog(r)
+					mu.Lock()
+					results[i].Error, results[i].Details, finished[i] = fmt.Sprintf("Internal error: %v", r), fmt.Sprint(r), true
+					mu.Unlock()
+				}
+			}()
 			start := time.Now()
+			vctx, cancel := context.WithTimeout(ctx, budget)
+			defer cancel()
 			var inv *Inventory
 			var sh []*Sheet
 			var e error
-			if perr := safely(func() { inv, sh, e = collectOne(ctx, t) }); perr != nil {
+			if perr := safely(func() { inv, sh, e = collectOne(vctx, t, opts) }); perr != nil {
 				e = perr
 			}
-			results[i].Took = time.Since(start)
+			r := ConnResult{Label: results[i].Label, Source: t.Source, User: t.User, Took: time.Since(start)}
 			if e != nil {
-				results[i].Error = e.Error()
-				return
+				r.Error, r.Details = friendlyError(e, budget, ctx.Err() != nil)
+				if ctx.Err() == nil { // not cancelled: say why we think it failed
+					nctx, ncancel := context.WithTimeout(context.Background(), 40*time.Second)
+					r.Network = networkCheck(nctx, t.Server)
+					ncancel()
+				}
+			} else {
+				r.OK = true
+				r.About = inv.About
+				r.VMs, r.Hosts, r.Clusters, r.DS = len(inv.VMs), len(inv.Hosts), len(inv.Clusters), len(inv.DS)
+				r.Warnings = inv.Warnings
 			}
-			results[i].OK = true
-			results[i].About = inv.About
-			results[i].VMs, results[i].Hosts, results[i].Clusters, results[i].DS = len(inv.VMs), len(inv.Hosts), len(inv.Clusters), len(inv.DS)
-			results[i].Warnings = inv.Warnings
-			per[i] = sh
+			mu.Lock()
+			results[i], per[i], finished[i] = r, sh, true
+			mu.Unlock()
+			if opts.Progress != nil {
+				if r.OK {
+					opts.Progress(r.Label, "done")
+				} else {
+					opts.Progress(r.Label, "failed")
+				}
+			}
 		}()
 	}
-	wg.Wait()
-	merged := MergeSheets(per)
-	return append([]*Sheet{connectionsSheet(results)}, merged...), results
+
+	// Wait for the workers, but never for longer than budget + grace after the user cancels:
+	// a hung vCenter must not be able to freeze the application.
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+		}
+	}
+
+	mu.Lock()
+	for i := range results {
+		if !finished[i] {
+			results[i].Error = "Stopped waiting: this vCenter did not respond in time."
+			results[i].Details = "abandoned"
+			per[i] = nil
+		}
+	}
+	snapshot := append([]ConnResult(nil), results...)
+	perCopy := append([][]*Sheet(nil), per...)
+	mu.Unlock()
+
+	merged := MergeSheets(perCopy)
+	out := []*Sheet{connectionsSheet(snapshot)}
+	out = append(out, merged...)
+	if w := warningsSheet(snapshot); w != nil {
+		out = append(out, w)
+	}
+	return out, snapshot
+}
+
+// friendlyError turns a raw error into a short, actionable message plus the technical detail.
+func friendlyError(err error, budget time.Duration, cancelled bool) (msg, details string) {
+	details = err.Error()
+	low := strings.ToLower(details)
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if !soap.IsVimFault(e) {
+			continue
+		}
+		switch soap.ToVimFault(e).(type) {
+		case *types.InvalidLogin:
+			return "Login rejected by this vCenter: the user name or password is wrong for it, or the account is locked. Check that the same account works when you log in to this vCenter directly.", details
+		case *types.NoPermission:
+			return "The account has no permission to read this vCenter's inventory (it needs at least read-only on the root folder).", details
+		}
+	}
+	switch {
+	case cancelled || errors.Is(err, context.Canceled):
+		return "Cancelled.", details
+	case strings.Contains(low, "incorrect user name or password") || strings.Contains(low, "cannot complete login"):
+		return "Login rejected by this vCenter: the user name or password is wrong for it, or the account is locked.", details
+	case strings.Contains(low, "deadline exceeded") || strings.Contains(low, "timeout") || strings.Contains(low, "timed out"):
+		return fmt.Sprintf("Timed out: this vCenter did not answer within the allowed time (limit %s per vCenter, %s to log in). It is probably slow or overloaded; increase the timeout and try again.", budget.Round(time.Second), min(loginTimeout, budget).Round(time.Second)), details
+	case strings.Contains(low, "x509") || strings.Contains(low, "certificate"):
+		return "The TLS certificate is not trusted. Untick 'Verify TLS certificate' to accept self-signed certificates.", details
+	case strings.Contains(low, "no such host"):
+		return "The name could not be resolved (DNS). Check the host name or use its IP address.", details
+	case strings.Contains(low, "connection refused"):
+		return "Connection refused: nothing is listening on that address and port.", details
+	case strings.Contains(low, "eof") || strings.Contains(low, "connection reset") || strings.Contains(low, "broken pipe"):
+		return "The vCenter dropped the connection while we were collecting (usually overload or a restarting service). Try again.", details
+	}
+	return details, details
+}
+
+// networkCheck gives a quick DNS / TCP / TLS timing summary for a server that failed, to tell a
+// slow or unreachable vCenter from a credentials problem.
+func networkCheck(ctx context.Context, server string) string {
+	u, err := parseServer(server)
+	if err != nil {
+		return ""
+	}
+	host, port := u.Hostname(), u.Port()
+	if port == "" {
+		port = "443"
+	}
+	var parts []string
+	t0 := time.Now()
+	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err != nil {
+		return "DNS lookup failed: " + err.Error()
+	}
+	parts = append(parts, fmt.Sprintf("DNS %s (%s)", addrs[0], time.Since(t0).Round(time.Millisecond)))
+	t1 := time.Now()
+	d := net.Dialer{Timeout: 15 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		return strings.Join(parts, "; ") + "; TCP " + port + " failed: " + err.Error()
+	}
+	parts = append(parts, fmt.Sprintf("TCP %s ok (%s)", port, time.Since(t1).Round(time.Millisecond)))
+	t2 := time.Now()
+	tc := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: host})
+	tc.SetDeadline(time.Now().Add(15 * time.Second))
+	if err := tc.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		return strings.Join(parts, "; ") + "; TLS handshake failed: " + err.Error()
+	}
+	parts = append(parts, fmt.Sprintf("TLS ok (%s)", time.Since(t2).Round(time.Millisecond)))
+	tc.Close()
+	return strings.Join(parts, "; ")
 }
 
 // MergeSheets concatenates same-named sheets from several vCenters, keeping first-seen order.
@@ -144,14 +335,28 @@ func tagVCenter(s *Sheet, label string) {
 }
 
 func connectionsSheet(rs []ConnResult) *Sheet {
-	s := &Sheet{Name: "vCenters", Header: []string{"vCenter", "Status", "Source", "User", "Product", "Version", "Build", "API version", "Instance UUID", "# VMs", "# Hosts", "# Clusters", "# Datastores", "Collect time", "Warnings", "Error"}}
+	s := &Sheet{Name: "vCenters", Header: []string{"vCenter", "Status", "Source", "User", "Product", "Version", "Build", "API version", "Instance UUID", "# VMs", "# Hosts", "# Clusters", "# Datastores", "Collect time", "Warnings", "Error", "Technical details", "Network check"}}
 	for _, r := range rs {
 		st := "Connected"
 		if !r.OK {
 			st = "Failed"
 		}
 		s.Rows = append(s.Rows, []any{r.Label, st, r.Source, r.User, r.About.FullName, r.About.Version, r.About.Build, r.About.ApiVersion, r.About.InstanceUuid,
-			r.VMs, r.Hosts, r.Clusters, r.DS, r.Took.Round(time.Millisecond).String(), len(r.Warnings), r.Error})
+			r.VMs, r.Hosts, r.Clusters, r.DS, r.Took.Round(time.Millisecond).String(), len(r.Warnings), r.Error, r.Details, r.Network})
+	}
+	return s
+}
+
+// warningsSheet lists every non-fatal problem (VMs or hosts that could not be fully read, and so on).
+func warningsSheet(rs []ConnResult) *Sheet {
+	s := &Sheet{Name: "Warnings", Header: []string{"vCenter", "Message"}}
+	for _, r := range rs {
+		for _, w := range r.Warnings {
+			s.Rows = append(s.Rows, []any{r.Label, w})
+		}
+	}
+	if len(s.Rows) == 0 {
+		return nil
 	}
 	return s
 }

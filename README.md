@@ -45,6 +45,15 @@ SDDC Manager discovery uses `POST /v1/tokens` and `GET /v1/vcenters` (falling ba
 log in to each vCenter with the given credentials. They are covered by tests against mock servers, not yet
 against a real VCF.
 
+## Slow or failing vCenters
+
+* Each vCenter has its own time limit (**Timeout per vCenter**, default 10 minutes; CLI `-vc-timeout`). A vCenter that
+  stalls is reported as *Timed out* and the others still load; the **Cancel** button stops a run at any time and keeps
+  whatever has finished. A slow vCenter is retried once with a gentler load.
+* The **vCenters** tab says why a connection failed in plain language (wrong login, TLS certificate, DNS, timeout,
+  dropped connection) with the raw error and a DNS/TCP/TLS timing check. VMs or hosts that could not be fully read
+  (for example no permission) no longer fail the whole vCenter; they are listed on the **Warnings** tab.
+
 ## Tabs
 
 vCenters, Info, CPU, Memory, Disk, Partition, Network, Snapshot, Tools, CD, Host, Cluster, RP, Datastore,

@@ -25,19 +25,20 @@ func main() {
 		}
 	}()
 	var (
-		server   = flag.String("s", os.Getenv("VI_SERVER"), "vCenter/ESXi host(s) or URL(s), comma separated (env VI_SERVER)")
-		user     = flag.String("u", os.Getenv("VI_USER"), "username (env VI_USER)")
-		pass     = flag.String("p", "", "password (env VI_PASSWORD; prompts if omitted)")
-		insecure = flag.Bool("insecure", true, "skip TLS certificate verification")
-		out      = flag.String("o", "", "output path (default bcvmtools_<server>_<timestamp>.xlsx, or a directory for csv)")
-		format   = flag.String("f", "xlsx", "output format: xlsx | csv")
-		timeout  = flag.Duration("timeout", 10*time.Minute, "overall timeout")
-		vcfOps   = flag.String("vcfops", "", "VCF Operations host (VCF 9.x): discover and collect from all its vCenters (uses -u/-p)")
-		vcfAuth  = flag.String("vcfauth", "", "VCF Operations auth source (blank = local user, e.g. vIDB)")
-		vcf      = flag.String("vcf", "", "SDDC Manager host (VCF 5.x / 9.0): discover and collect from all its vCenters (uses -u/-p)")
-		vcUser   = flag.String("vcuser", "", "user for the discovered vCenters (default: same as -u)")
-		vcPass   = flag.String("vcpass", "", "password for the discovered vCenters (default: same as -p)")
-		showVer  = flag.Bool("version", false, "print version")
+		server    = flag.String("s", os.Getenv("VI_SERVER"), "vCenter/ESXi host(s) or URL(s), comma separated (env VI_SERVER)")
+		user      = flag.String("u", os.Getenv("VI_USER"), "username (env VI_USER)")
+		pass      = flag.String("p", "", "password (env VI_PASSWORD; prompts if omitted)")
+		insecure  = flag.Bool("insecure", true, "skip TLS certificate verification")
+		out       = flag.String("o", "", "output path (default bcvmtools_<server>_<timestamp>.xlsx, or a directory for csv)")
+		format    = flag.String("f", "xlsx", "output format: xlsx | csv")
+		timeout   = flag.Duration("timeout", 10*time.Minute, "overall timeout")
+		vcfOps    = flag.String("vcfops", "", "VCF Operations host (VCF 9.x): discover and collect from all its vCenters (uses -u/-p)")
+		vcfAuth   = flag.String("vcfauth", "", "VCF Operations auth source (blank = local user, e.g. vIDB)")
+		vcf       = flag.String("vcf", "", "SDDC Manager host (VCF 5.x / 9.0): discover and collect from all its vCenters (uses -u/-p)")
+		vcUser    = flag.String("vcuser", "", "user for the discovered vCenters (default: same as -u)")
+		vcPass    = flag.String("vcpass", "", "password for the discovered vCenters (default: same as -p)")
+		vcTimeout = flag.Duration("vc-timeout", 10*time.Minute, "time allowed for each vCenter (connect + collect)")
+		showVer   = flag.Bool("version", false, "print version")
 	)
 	gui := flag.Bool("gui", false, "open the graphical interface (default when started without arguments on Windows)")
 	attachConsole()
@@ -106,7 +107,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "VCF Operations %s: found %d vCenter(s)\n", *vcfOps, len(vcs))
 	}
 	targets = dedupeTargets(targets)
-	sheets, results := CollectMany(ctx, targets)
+	sheets, results := CollectMany(ctx, targets, Options{Timeout: *vcTimeout, Progress: func(label, state string) {
+		fmt.Fprintf(os.Stderr, "  %-30s %s\n", label, state)
+	}})
 	ok, vms, hosts := 0, 0, 0
 	for _, r := range results {
 		if r.OK {
