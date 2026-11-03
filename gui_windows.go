@@ -330,6 +330,14 @@ func runGUI() error {
 		sheets []*Sheet
 		models []*sheetModel
 	)
+	// Make sure the per-user data folder exists and is writable before doing anything else.
+	if _, err := appDataDir(); err != nil {
+		walk.MsgBox(nil, "BCVMTools cannot start",
+			err.Error()+"\n\nBCVMTools stores its settings and crash log in this folder. "+
+				"Fix the folder permissions (or ask your administrator) and start the application again.",
+			walk.MsgBoxIconError)
+		return err
+	}
 	set := loadSettings()
 	if set.Width < 1000 || set.Height < 600 {
 		set.Width, set.Height = 1360, 820

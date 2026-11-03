@@ -186,3 +186,23 @@ func safely(fn func()) (err error) {
 	fn()
 	return nil
 }
+
+// appDataDir returns <user config dir>\BCVMTools (e.g. %AppData%\BCVMTools), creating it if
+// it does not exist, and proves it is writable. The error says exactly what is wrong.
+func appDataDir() (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot locate the user configuration folder (%%AppData%%): %w", err)
+	}
+	dir := filepath.Join(base, "BCVMTools")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("cannot create the folder %s: %w", dir, err)
+	}
+	probe, err := os.CreateTemp(dir, ".write-test-*")
+	if err != nil {
+		return "", fmt.Errorf("the folder %s exists but you do not have permission to write to it: %w", dir, err)
+	}
+	probe.Close()
+	os.Remove(probe.Name())
+	return dir, nil
+}
