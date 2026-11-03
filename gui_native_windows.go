@@ -83,19 +83,19 @@ func (s *subclass) drawItem(cd *win.NMCUSTOMDRAW) {
 	}
 	sc := func(v int32) int32 { return v * dpi / 96 }
 	hdc, rc := cd.Hdc, cd.Rc
-	bg, fg := rgb(58, 68, 82), rgb(255, 255, 255)
+	bg, fg := rgb(226, 232, 240), rgb(28, 38, 54) // light blue-grey with dark bold text
 	if filtered {
-		bg, fg = rgb(255, 193, 7), rgb(30, 30, 30)
+		bg, fg = rgb(255, 214, 110), rgb(28, 28, 28)
 	}
 	if cd.UItemState&1 != 0 { // pressed
 		if filtered {
-			bg = rgb(235, 173, 0)
+			bg = rgb(245, 198, 80)
 		} else {
-			bg = rgb(80, 92, 108)
+			bg = rgb(205, 214, 226)
 		}
 	}
 	fillRect(hdc, &rc, bg)
-	fillRect(hdc, &win.RECT{Left: rc.Right - 1, Top: rc.Top, Right: rc.Right, Bottom: rc.Bottom}, rgb(92, 104, 120))
+	fillRect(hdc, &win.RECT{Left: rc.Right - 1, Top: rc.Top, Right: rc.Right, Bottom: rc.Bottom}, rgb(176, 186, 200))
 
 	if s.font == 0 {
 		var lf win.LOGFONT
