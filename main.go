@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -18,6 +20,12 @@ import (
 var version = "dev"
 
 func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			writeCrashLog(r)
+			panic(r)
+		}
+	}()
 	var (
 		server   = flag.String("s", os.Getenv("VI_SERVER"), "vCenter/ESXi host or URL (env VI_SERVER)")
 		user     = flag.String("u", os.Getenv("VI_USER"), "username (env VI_USER)")
@@ -100,6 +108,11 @@ func main() {
 // CollectAll connects, gathers the full inventory and builds the sheets.
 // Shared by the CLI and the GUI.
 func CollectAll(ctx context.Context, server, user, password string, insecure bool) (inv *Inventory, sheets []*Sheet, host string, tConn time.Duration, err error) {
+	err = safely(func() { inv, sheets, host, tConn, err = collectAll(ctx, server, user, password, insecure) })
+	return
+}
+
+func collectAll(ctx context.Context, server, user, password string, insecure bool) (inv *Inventory, sheets []*Sheet, host string, tConn time.Duration, err error) {
 	start := time.Now()
 	u, err := parseServer(server)
 	if err != nil {
@@ -142,4 +155,34 @@ func parseServer(s string) (*url.URL, error) {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "error:", err)
 	os.Exit(1)
+}
+
+// writeCrashLog appends a panic with its stack to <user config dir>/BCVMTools/crash.log
+// (the GUI build has no console, so this is the only trace of an unexpected failure).
+func writeCrashLog(v any) string {
+	d, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	p := filepath.Join(d, "BCVMTools", "crash.log")
+	os.MkdirAll(filepath.Dir(p), 0o755)
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "---- %s\n%v\n%s\n", time.Now().Format(time.RFC3339), v, debug.Stack())
+	return p
+}
+
+// safely runs fn and converts a panic into an error (and a crash-log entry).
+func safely(fn func()) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			p := writeCrashLog(r)
+			err = fmt.Errorf("internal error: %v (details in %s)", r, p)
+		}
+	}()
+	fn()
+	return nil
 }

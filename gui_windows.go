@@ -624,6 +624,30 @@ func runGUI() error {
 	}
 
 	busy := false
+	endBusy := func() {
+		busy = false
+		collectBtn.SetEnabled(true)
+		gb.SetEnabled(true)
+		progress.SetVisible(false)
+	}
+	finish := func(inv *Inventory, ss []*Sheet, err error, t0 time.Time) {
+		endBusy()
+		if err != nil {
+			setStatus("Failed: " + err.Error())
+			walk.MsgBox(mw, "Collection failed", err.Error(), walk.MsgBoxIconError)
+			return
+		}
+		showSheets(ss)
+		msg := fmt.Sprintf("Collected %d VMs, %d hosts, %d datastores in %s. Review the tabs, then export.",
+			len(inv.VMs), len(inv.Hosts), len(inv.DS), time.Since(t0).Round(time.Millisecond))
+		if len(inv.Warnings) > 0 {
+			msg += fmt.Sprintf(" (%d warnings, first: %s)", len(inv.Warnings), inv.Warnings[0])
+		}
+		setStatus(msg)
+		if i := curIdx(); i >= 0 {
+			cntItem.SetText(fmt.Sprintf("%s: %d of %d rows shown", models[i].sheet.Name, len(models[i].view), len(models[i].sheet.Rows)))
+		}
+	}
 	doCollect := func() {
 		if busy {
 			return
@@ -642,26 +666,13 @@ func runGUI() error {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 			defer cancel()
 			t0 := time.Now()
-			inv, ss, _, _, err := CollectAll(ctx, srv, usr, pw, ins)
+			inv, ss, _, _, err := CollectAll(ctx, srv, usr, pw, ins) // recovers panics into err
 			mw.Synchronize(func() {
-				busy = false
-				collectBtn.SetEnabled(true)
-				gb.SetEnabled(true)
-				progress.SetVisible(false)
-				if err != nil {
-					setStatus("Failed: " + err.Error())
-					walk.MsgBox(mw, "Collection failed", err.Error(), walk.MsgBoxIconError)
-					return
-				}
-				showSheets(ss)
-				msg := fmt.Sprintf("Collected %d VMs, %d hosts, %d datastores in %s. Review the tabs, then export.",
-					len(inv.VMs), len(inv.Hosts), len(inv.DS), time.Since(t0).Round(time.Millisecond))
-				if len(inv.Warnings) > 0 {
-					msg += fmt.Sprintf(" (%d warnings: %s)", len(inv.Warnings), inv.Warnings[0])
-				}
-				setStatus(msg)
-				if i := curIdx(); i >= 0 {
-					cntItem.SetText(fmt.Sprintf("%s: %d of %d rows shown", models[i].sheet.Name, len(models[i].view), len(models[i].sheet.Rows)))
+				// showing the results must not be able to kill the app either
+				if perr := safely(func() { finish(inv, ss, err, t0) }); perr != nil {
+					endBusy()
+					setStatus(perr.Error())
+					walk.MsgBox(mw, "Unexpected error", perr.Error(), walk.MsgBoxIconError)
 				}
 			})
 		}()
